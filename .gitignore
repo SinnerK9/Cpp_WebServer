@@ -1,0 +1,37 @@
+# --- 编译产生的二进制文件 ---
+*.o
+*.obj
+*.so
+*.a
+*.lib
+*.exe
+*.out
+*.app
+
+# --- 项目构建产生的中间件 ---
+# 如果你用 CMake，过滤掉 build 文件夹
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# --- 具体的程序输出 ---
+# 比如你的 TinyWebServer 编译出的可执行程序名（假设叫 server）
+server
+test_bin
+
+# --- 日志和调试文件 ---
+*.log
+*.dSYM/
+core
+
+# --- 编辑器/IDE 相关 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- 操作系统临时文件 ---
+.DS_Store
+Thumbs.db
