@@ -55,3 +55,117 @@ yield表示该线程主动让出当前时间片把资源交给其他线程
 
 **值和引用问题**
 线程函数的参数默认按值拷贝到线程内部，即使线程函数的参数是引用类型，在线程函数中修改后也影响不到实参本身。如果要传入引用使得内部操作影响实参，必须在构造thread对象过程中借助std::ref函数
+
+
+## 2026.3.30 mutex的基本认识
+
+大凡多线程管理，总要涉及到资源共享和线程安全问题，当多个线程同时读写共享资源时，可能会产生数据不一致或者冲突。锁的意义就是确保同一时刻只有一个线程可以访问共享资源，本质是保持数据一致性和准确性。互斥量mutex就是用来保证每个线程的访问过程不被其他线程打断的机制。
+
+### 为什么需要Mutex
+每个线程拥有自己独立的栈结构，但是全局变量等临界资源是直接被多个线程共享的。当不同的线程同时操作全局变量时，可能导致冲突，次数越多表现越明显，所以在多线程编程中，需要对共享资源进行适当的同步控制，加锁保护是实现这一点的关键手段。
+
+### 四类互斥锁
+std::mutex是最基本的互斥量，对象之间**既不能拷贝也不能移动。**
+基本mutex主要有三类方法：lock,try_lock,unlock，作用十分显然。比如说两个线程同时对某个全局变量进行修改，加锁之后，任意时刻只有一个线程能修改，这就避免了竞争。
+在加锁的时候，要注意加锁的位置。
+
+std::recursive_mutex，意为递归互斥锁，主要用在递归加锁的场景中。
+普通锁的特点是重复加锁导致阻塞，假如有这么一个函数：
+void func(int n){
+	if(n== 10){
+	return;
+	}
+	mtx.lock();
+	n++;
+	func(n);
+	mtx.unlock()
+}
+第一次上锁后，还没有解锁就递归调用函数再上一次锁，使用普通mutex会导致此处产生阻塞，这种抢到了锁但是无法申请再次上锁的情况就是死锁。
+recursive_mutex的解决方法时，它使得自己持有锁资源的时候无需再做申请。
+
+std::timed_mutex为时间互斥锁，具备定时解锁的功能。若到时间未解锁就自动解锁。其中有两种方法：try_lock_for和try_lock_until，一个表示相对时间一个表示绝对时间点。
+
+最后一种锁是std::recursive_timed_mutex，对时间互斥锁有递归方面升级。
+
+### RAII风格锁
+RAII是现代C++编程的重要特点之一，翻译为资源获取即初始化，将资源的生命周期与对象的生命周期绑在一起，利用自动析构保证资源的释放。对于mutex来说RAII的思想尤为重要，因为手动加锁解锁会面临巨大的死锁风险，是对程序员的严峻考验。
+void dangerousFunction(int id) {
+    try {
+        // 使用 RAII 风格的锁管理
+        std::lock_guard<std::mutex> lock(mtx);
+
+        std::cout << "Thread " << id << " is running." << std::endl;
+
+        // 模拟异常情况，抛出异常
+        if (id == 1) {
+            throw std::runtime_error("Thread 1 encountered an error!");
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "Exception caught in thread " << id << ": " << e.what() << std::endl;
+    }
+
+}
+
+int main() {
+    try {
+        std::thread t1(dangerousFunction, 1);
+        std::thread t2(dangerousFunction, 2);
+
+        t1.join();
+        t2.join();
+    } catch (const std::exception& e) {
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+    }
+
+    return 0;
+}
+这样的一段代码是对RAII思想的体现，对象lock在创建时调用mtx.lock()，每次离开try作用域时都会调用析构函数进行unlock，保证锁被成功释放。
+
+容易发现，此处并没有直接的unlock方法，而是采用了lock_guard类，用于实现资源的自动加锁和解锁，是RAII思想的体现，确保在作用域结束时自动释放锁资源。
+
+lock_guard有以下特点：
+**自动加锁**：创建对象时立即对互斥量加锁，确保进入临界区前已获得锁。
+**自动解锁**：作用域结束时自动释放互斥量，避免资源泄漏和死锁。
+**适用局部锁定**：通过栈上对象实现，只适用于局部范围的互斥量锁定。
+
+另一个重要模板类是unique_lock，std::unique_lock 是 std::lock_guard 的增强版，提供了更灵活的加锁 / 解锁控制，支持延迟加锁、手动解锁、与条件变量配合使用等场景。
+具备以下核心特点：
+**灵活的加解锁时机**：可以手动调用 lock()/unlock()，不需要在创建时立即加锁。
+**支持延迟加锁**：创建对象时可以选择不立即加锁，后续再手动获取锁。
+**可与条件变量（std::condition_variable）配合**：实现复杂的线程同步与等待机制。
+**RAII 保障**：生命周期结束时仍会自动解锁，避免资源泄漏。
+
+在此基础上，unique_lock由于其灵活性，可以脱离lock_guard局部加锁的拘束，甚至可用get_lock方法把锁作为返回值传出去。
+
+
+### 条件变量()
+std::condition_variable 是 C++ 标准库中用于线程间条件同步的类，核心是等待-通知机制：
+线程可以调用 wait 系列函数，主动进入等待状态，直到某个条件满足。
+另一个线程在条件满足时，调用 notify_one/notify_all 唤醒等待的线程。
+
+
+**重要方法：**
+wait(unique_lock<mutex>& lock)：使当前线程进入无限等待，直到被notify_one()/notify_all()唤醒。调用时会自动释放锁，被唤醒后会重新获取锁。
+
+wait_for(unique_lock<mutex>& lock, duration)：使线程最多等待指定时长，超时或被唤醒时返回。返回值：
+std::cv_status::timeout：等待超时
+std::cv_status::no_timeout：被唤醒
+
+wait_until(unique_lock<mutex>& lock, time_point)：使线程等待到指定绝对时间点，超时或被唤醒时返回，返回值同 wait_for。
+
+notify_one()：唤醒一个正在等待的线程（如果有多个，随机选一个）。
+
+notify_all()：唤醒所有正在等待的线程。
+
+关键特点与注意点：
+必须配合 std::unique_lock 使用：
+wait 会在等待时自动释放锁，这要求锁必须支持手动解锁，所以只能用 std::unique_lock，不能用 std::lock_guard。
+虚假唤醒：
+线程可能在没有调用 notify 的情况下被唤醒，所以必须在循环中检查条件，不能只判断一次：
+
+while (!condition) {
+    cv.wait(lock);
+}
+等待时释放锁
+调用 wait 后，锁会被释放，让其他线程可以修改共享变量；被唤醒后，wait 会重新获取锁，保证临界区安全。
