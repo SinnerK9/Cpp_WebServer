@@ -6,6 +6,7 @@
 #include<queue>
 #include<atomic>
 #include<functional>
+#include<future>
 
 class threadpool {
 private:
@@ -51,16 +52,33 @@ public:
         }
     }
     //submit方法：生产者提交任务到任务序列
-    void submit(std::function<void()> task){
+    template<typename F, typename ...Args> //模板编程：F表示任何函数，...Args表示传入的参数集
+    auto submit(F &&f , Args && ...args) // &&表示万能引用 auto + -> 是后置返回参数的写法！这里表示返回的是以该函数的返回类型为返回类型的future
+    -> std::future<decltype(f(args...))>{   //decltype方法得到类型
+        using return_type = decltype(f(args...)); //相当于typedef
+        //这一段语法最为关键：先把原来的函数和参数bind在一起，参数通过forward传入
+        //然后，将其打包为packaged_task，使得其能够传出返回值到future中，其类型为我们得到的return_type()
+        //然后，将这个packaged_task转化为共享指针，使其能够拷贝。
+        auto task = std::make_shared<std::packaged_task<return_type()>(std::bind(std::forward<F>(f),std::forward<Args>(args)...))>;
+        //注意：task是一个共享指针，内部的packaged_task才是真正的任务本身，get_future是packaged_task的方法
+        std::future<return_type> result = task -> get_future();
+
         {
             std::lock_guard<std::mutex> lock(mtx);
             if(stop){
+                std::cout << "线程池已停止，不再提交" << std:: endl;
                 throw std::runtime_error("线程池已停止");
             }
-            tasks.push(move(task)); //注意：此处要使用移动语义
+            //注意：threadpool执行函数只会直接task()，执行一个function<void()>，无法辨析task是不是共享指针！
+            //在此我们把共享指针解引用并且执行packaged_task中的真正任务的操作封装成了一个function<void()>，这样才可以传进去直接task()执行。
+            tasks.push([task](){
+                (*task)();
+            });
         }
-        condition.notify_one();//唤醒一个等待的线程
+        return result;
+        condition.notify_one();
     }
+
     //析构方法，设定线程池停止，唤醒所有线程并且等待他们最终执行完
     ~threadpool(){
         {
