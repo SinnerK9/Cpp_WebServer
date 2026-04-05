@@ -59,7 +59,7 @@ public:
         //这一段语法最为关键：先把原来的函数和参数bind在一起，参数通过forward传入
         //然后，将其打包为packaged_task，使得其能够传出返回值到future中，其类型为我们得到的return_type()
         //然后，将这个packaged_task转化为共享指针，使其能够拷贝。
-        auto task = std::make_shared<std::packaged_task<return_type()>(std::bind(std::forward<F>(f),std::forward<Args>(args)...))>;
+        auto task = std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(f),std::forward<Args>(args)...));
         //注意：task是一个共享指针，内部的packaged_task才是真正的任务本身，get_future是packaged_task的方法
         std::future<return_type> result = task -> get_future();
 
@@ -75,8 +75,8 @@ public:
                 (*task)();
             });
         }
-        return result;
         condition.notify_one();
+        return result;//debug:return必须在唤醒线程之后
     }
 
     //析构方法，设定线程池停止，唤醒所有线程并且等待他们最终执行完
