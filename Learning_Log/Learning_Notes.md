@@ -226,3 +226,83 @@ RAII 锁：lock_guard（简单场景用，轻量）、unique_lock（条件变量
 在解决上述两个核心问题后，我们将目光重新投向执行层面，发现了一个新的问题：std::packaged_task是不可拷贝的，而线程池的任务队列std::queue<std::function<void()>>，以及lambda捕获，都要求存入/捕获的对象具备可拷贝性，std::packaged_task的不可拷贝性与这个要求冲突！
 因此，我们采用的解决方案是：在std::packaged_task外套一层可拷贝的智能指针std::shared_ptr。std::shared_ptr本身支持任意拷贝，且多个拷贝会指向同一个std::packaged_task对象，同时它具备生命周期安全的特点，能够完美适配多线程编程场景。具体实现思路是：通过std::make_shared方法创建std::packaged_task的共享指针，再在lambda中捕获这个共享指针，这样既满足了可拷贝要求，又能正常执行任务。
 实际生产中，工作线程所要执行的任务函数，其参数类型和返回值类型极其多样，为了对这些不同类型的任务进行统一封装，让submit方法支持任意函数和任意参数，我们引入了可变参数模板和std::forward。其中，模板<typename F, typename... Args>用于接收任意类型的函数F和任意数量、任意类型的参数Args...；std::forward用于实现“完美转发”，保留参数的原始值类别（左值/右值），避免不必要的拷贝，提升效率；再配合decltype(f(args...))自动推导函数的返回值类型，最终构成了通用的submit方法，实现了线程池对任意任务的支持。
+
+
+## 2026.4.5 退出问题
+解决线程池的返回值问题后，在与大模型讨论优化方法时，我注意到了另一个问题：现有的线程池析构函数最终只等待线程结束，而非等待任务全部完成，尽管在构造函数的判断逻辑中有对任务序列的判空逻辑，这段代码仍然有可优化之处。我想到的方法是，让我们可以显式地看到所有任务已经完成，并且在析构函数中增加一段判断任务完成的代码，其次再等待线程结束。
+为了达到这个效果，考虑在线程池的底层构造里增加一个变量pending_task来记录已经提交但尚未完成的任务数，提交时该变量增加，而任务执行完毕后减少，pending_task变量使用atomic型保证多线程加减安全。
+
+## 2026.4.6 构造服务器的新认识
+把视角重新回到我的TCP_Server上面来，这个基础架构还有诸多不足之处，严重影响了它的实用性。梳理一下我利用学习的知识优化服务器架构的过程。
+注意我初始的接受连接部分代码：
+while(true){ 
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+        int client_socket = accept(listenfd, (struct sockaddr*)&client_addr, &client_addr_len);
+        if (client_socket < 0) {
+            continue;
+        }
+        cout << "Client Connected! IP: " << inet_ntoa(client_addr.sin_addr) << endl;
+        char buf[1000] = {0};
+        int byte_read = recv(client_socket, buf, sizeof(buf) - 1, 0);
+        cout << "Received: " << buf << endl;
+        const char* response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>Hello!</h1>";
+        send(client_socket, response, strlen(response), 0);
+        close(client_socket);
+    }
+首先，容易发现：当我们没有接收到连接时，整个线程在accept处阻塞，CPU空转闲置，利用率极低。其次，recv()阶段的效率也完全依赖于客户端发送数据的效率，一旦此处发送效率低，线程又被挂起。整个死循环服务器只有处理完一个客户端请求才能处理下一个，大部分时间用于等待I/O。而不是真正执行计算，这直接体现出了服务器基础架构层面的问题。
+在学习多线程知识之后，我对这段核心代码进行第一次重写：
+    vector<std::thread> Threads; 
+    while(true){ 
+        ...
+        cout << "Client Connected! IP: " << inet_ntoa(client_addr.sin_addr) << endl;
+        thread client_thread(Handle_Client, client_socket, client_addr);
+        client_thread.detach();  // 分离线程，不等待它结束
+    }
+     for(auto& t : Threads) {
+        if(t.joinable()) {
+            t.join();
+        }
+    }
+经过这次改写，核心处理逻辑变为：每当接收到一个请求之后，主线程把它丢给一个新建的子线程让它一边处理去，自己继续接收别的请求。这解决了每次只能处理一个客户端的问题，但是线程创建，销毁和上下文切换的过程带来了巨大的额外开销，涌入大量请求时，给每个请求分配一个线程的开销是无法承受的，并且accept()阶段阻塞的问题并没有在这次优化中被解决。
+完成基本的线程池后，可以执行第二次改写：
+threadpool pool(8); //优化：创造一个8线程线程池
+    while(true){ 
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);//debug：此处用到的IP长度必须是socklen_t类型，其本质是一个无符号整型，用int会报错
+        int client_socket = accept(listenfd, (struct sockaddr*)&client_addr, &client_addr_len);
+        if (client_socket < 0) {
+            perror("Accept Error!");
+            continue;
+        }
+        cout << "Client Connected! IP: " << inet_ntoa(client_addr.sin_addr) << endl;
+        pool.submit(Handle_Client, client_socket, client_addr); //将处理客户端请求和函数和所有参数传入submit令其打包成packagedtask
+    }
+此次优化实现了复用线程，减少创建开销，并且控制了并发线程数，不至于一次性产生大量线程。
+但本质上，accept()依旧是阻塞的，一旦阻塞，会影响新连接的处理，同样地，线程池的大量闲置仍然影响了CPU资源的利用率。
+于是我们可以提出一个解决方向，即不再让快速的CPU等待慢速的IO，线程只在有数据时被唤醒，这就有效地优化了资源浪费问题。
+
+## 2026.4.7 IO模型认识
+当前服务器：阻塞 I/O + 线程池
+线程调用 accept / recv 时，若没有数据 / 连接，会在内核中被阻塞挂起。
+挂起期间不占用 CPU，但会占用线程资源（栈、内核数据结构等）。
+一个线程同一时间只能绑定并等待一个连接。
+一旦某个连接因慢客户端等原因长时间阻塞，就会直接浪费整个线程。
+线程池容量有限，线程被大量阻塞后，服务器处理能力会急剧下降。
+改进第一步：非阻塞 I/O
+将 socket 设置为非阻塞，accept / recv 无论有无数据都会立即返回。
+线程不会被卡住，可以循环处理多个连接，不再被单个连接绑定。
+但线程需要不断主动轮询所有文件描述符，全程处于运行状态。
+导致 CPU 持续空转，大量浪费时间片，系统负载高，业务效率反而变差。
+
+在查询资料过后，我了解到可以用IO多路复用模型来进行优化！所谓IO多路复用的本质，是把反复轮询是否有客户端请求的工作从线程递交给了操作系统内核，让内核来同时监控大量的连接。
+初始的解决方案名为select，简而言之，它的原理是把大量fd放进一个集合，调用select之后内核会遍历所有fd，检查哪一个处于就绪状态。一旦其中一些fd变得可以读写，就提醒线程开始工作。这样优化的好处显而易见，它可以直接解决两个问题：无请求的时候线程可以直接挂起，不占CPU；不需要一个线程对应一个连接，大大省下开销。在此基础上可以对我的server进行第一次优化，采用select方法构建。
+
+## 2026.4.8 Select学习
+在使用 select 重构服务器代码之前，我们需要先了解 select 服务器的完整工作流程。
+select 是一种单线程 I/O 多路复用模型，核心优势是：让一个线程同时监控多个文件描述符，解决传统模型中accept和recv两处阻塞无法同时处理的问题。
+**工作流程：**
+先创建服务端监听 socket（listenfd），完成 bind 和 listen，准备接收客户端连接。再创建一个总监听集合，将listenfd加入其中。这个集合里的所有 fd，都会由内核统一监控。
+前置事项实现完毕后，进入select主循环：循环是select模型的工作主体，每次循环必须复制一份完整的总监听集合，传给select函数（select会修改传入的集合）。select开始阻塞等待，直到集合中任意一个 fd 就绪（新连接到达 / 客户端发送数据）。内核检测到就绪事件后，select返回，并自动清空未就绪的fd，只在集合中保留就绪fd。
+遍历所有 fd，检查哪些处于就绪集合中：如果是监听fd就绪，则处理新连接accept，将新的客户端fd加入总监听集合。如果是客户端fd就绪，则调用recv读取数据，并进行业务处理、回复响应。
+当客户端断开连接、读取出错或处理完成时：关闭对应的 socket并将该 fd 从总监听集合中移除，避免无效监听。
