@@ -320,3 +320,34 @@ int select(
     NULL,                // 异常集合（不用）
     NULL                 // 超时时间：NULL = 永久阻塞
 );
+
+## 2026.4.10-4.11 select->poll
+目前，select服务器已经完全远离了生产环境，它本身带有严重影响投入实际使用的缺点，这是它的设计缺陷导致的。
+select服务器的硬伤是什么？
+1：select方法中创建的fd_set是被linux内核写死的固定大小位图，默认宏决定其最多监听1024个fd。想要拓展需要重新编译内核，非常麻烦。
+2：以select服务器中的实际代码为例，必须写一句read_fds = master_set给select用。这意味着每次都要把所有fd拷贝一遍，随着连接数增加这个过程会占用更多资源。
+3：遍历效率不理想，每次要遍历0-maxfd，进行大量FD_ISSET判断。尽管其中的很多fd根本未曾就绪，或者干脆就是空的。
+4：作为内核系统调用，select每次需要将临时集合read_fds从用户空间拷贝到内核空间，修改完毕后又拷贝回去，连接增加则性能暴跌。
+
+对于select面临的诸多困境，我们的第一个解决方案是poll。
+poll解决了select的部分痛点：
+1：最核心地，其解除了select模型1024硬限制问题，其最大长度只受系统内存限制，比1024个fd大得多。
+2：创新性地运用了event和revents的事件模型，想要监听的事件和内核返回的事件分离，无需破坏原始数据。相反地，select所有的操作都发生在fd_set上，传入的set还会被内核直接暴力修改，最后返回的仍然是fd_set，逻辑相当混乱。
+3：避免了max_fd的维护。
+
+poll的特殊方法：
+**pollfd结构体**：poll模型最标志性的结构，用于替代select的fd_set，存放要监听的fd和事件，其定义如下：
+struct pollfd {
+    int fd;        // 你要监听的文件描述符（listenfd / clientfd）
+    short events;  // 【你告诉内核】你想监听什么事件
+    short revents; // 【内核告诉你】实际发生了什么事件
+};
+
+**POLLIN**：poll专属的事件宏，表示“有数据可以读”。对于listenfd，这代表着有新连接，对于clientfd，这代表着有客户端发数据了。主要用fd来区分究竟发生了什么事件。代码中主要有两次用到，
+fds[i].events = POLLIN;    //告诉内核要监听读事件
+if (fds[i].revents & POLLIN)// 内核返回：真的有读事件（此处语法代表的意思：返回的事件中是否包含POLLIN？）
+
+**poll函数**：用于把所有要监听的pollfd交给内核，内核阻塞等待直到事件发生。
+int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+传入三个参数，分别为结构体数组首地址，有效fd数量，以及timeout，表示等待多久后返回，-1表永久阻塞
+
