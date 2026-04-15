@@ -8,6 +8,7 @@
 #include <fcntl.h> //优化1：用于设置非阻塞的头文件
 #include <errno.h>
 #include <signal.h> //优化4：用于设置忽略SIGPIPE逻辑 
+#include "Threadpool.h"
 
 using namespace std; 
 
@@ -26,8 +27,23 @@ int setnonblocking(int fd){
     return old_flag;
 }
 
+void handle_client(int fd,int epoll_fd){
+    std::cout << "fd " << fd << " 的完整请求内容: \n" << users[fd].buffer << endl;
+    const char* response = "HTTP/1.1 200 OK\r\n\r\n<h1>Hello</h1>";
+    send(fd, response, strlen(response), 0);
+    users[fd].buffer.clear(); 
+    //关键步骤：在第一次请求之后，EPOLLONESHOT屏蔽了该socket的后续请求，它的事件在事件表里不再被触发
+    //必须把这个fd的事件在事件表里重新激活，换一套新的状态参数
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT| EPOLLRDHUP;   //下一次它还是需要EPOLLONESHOT
+    ev.data.fd= fd;
+    epoll_ctl(epoll_fd,EPOLL_CTL_MOD,fd,&ev); //用EPOLL_CTL_MOD修改参数，而非增加，它一直在红黑树里
+}
+
 int main() {
+
     signal(SIGPIPE, SIG_IGN); //设置忽略SIGPIPE
+    threadpool pool(8);//创建线程池
     int listenfd = socket(PF_INET, SOCK_STREAM, 0);
     if (listenfd < 0) {
         perror("Socket Error!");
@@ -47,7 +63,6 @@ int main() {
         perror("Bind Error!");
         return -1;
     }
-
 
     ret = listen(listenfd, 5);
     if (ret < 0) {
@@ -74,7 +89,7 @@ int main() {
         return -1;
     }
 
-    struct epoll_event events[1024];
+    struct epoll_event events[1024];//存储返回的就绪事件：注意，跟红黑树里的事件完全不是一回事，不能用fd下标访问对应事件
 
     while(true){ 
         int n = epoll_wait(epoll_fd,events,1024,-1);
@@ -111,7 +126,8 @@ int main() {
                     std::cout << "新连接：" << client_fd << std::endl;
                     std::cout << "新连接IP:" << inet_ntoa(client_addr.sin_addr) << std::endl;
                     struct epoll_event client_ev;
-                    client_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP; //优化3：LT->ET:规定电平触发 + 监听客户端断开
+                    //增加EPOLLONESHOT，保证一个fd同时只被一个线程处理
+                    client_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT; //优化3：LT->ET:规定电平触发 + 监听客户端断开
                     client_ev.data.fd = client_fd;
                     if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0){
                         perror("epoll_ctl: client_fd");
@@ -119,6 +135,7 @@ int main() {
                     }
                 }
             }else{
+                //recv将网卡中请求从内核读到用户态，需要由主线程来完成
                 while(true){ //优化2：给recv加上死循环，优化单次recv和数据分开发导致读取不全，以及重复wait的问题
                     char buf[1024] = {0};
                     int byte_read = recv(curr_fd,buf,sizeof(buf)-1,0);
@@ -132,15 +149,11 @@ int main() {
                         break;
                     }else if(byte_read < 0){
                         if(errno == EAGAIN||errno == EWOULDBLOCK){
-                            //这会数据真全读完了，现在的buffer存的确实是所有数据，可以回复了
                             if(!users[curr_fd].buffer.empty()){
-                                std::cout << "fd " << curr_fd << " 的完整请求内容: \n" << users[curr_fd].buffer << endl;
-                                const char* response = "HTTP/1.1 200 OK\r\n\r\n<h1>Hello</h1>";
-                                send(curr_fd, response, strlen(response), 0);
-                                users[curr_fd].buffer.clear(); //要清空这个fd的数据
+                            pool.submit(handle_client,curr_fd,epoll_fd); //send部分不再交给主线程，而是丢到线程池的任务队列                              
                             }
                             break;
-                        } //数据读完了，跳出循环
+                        }
                         perror("recv");
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr_fd, NULL);
                         close(curr_fd); //真出错了，关闭连接

@@ -516,4 +516,50 @@ break;
 
 记得给每次退出增加清空buffer环节！
 
-#### 多线程优化与线程池接入：涉及大面积重构，明天再干！
+#### 线程池 + EPOLLONESHOT，IO与业务解耦
+1. 注册客户端事件时增加 EPOLLONESHOT
+在 accept 新连接后，给 client_ev 加上：
+client_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT;
+作用：EPOLLONESHOT使得一个fd对应的事件在执行过一次后不再可执行，防止多个线程同时接管。
+
+2. 主线程不再处理业务，只负责处理与内核有关的事务：
+读数据 → 拼到全局 buffer
+数据读完 → 把任务丢给线程池
+立刻返回事件循环，处理下一个连接
+else if(byte_read < 0){
+    if(errno == EAGAIN||errno == EWOULDBLOCK){
+        if(!users[curr_fd].buffer.empty()){
+            pool.submit(handle_client, curr_fd, epoll_fd);
+        }
+        break;
+    }
+}
+
+3. 业务处理函数 handle_client 在线程池中执行
+void handle_client(int fd,int epoll_fd){
+    // 处理HTTP请求（解析、查找、拼接响应…）
+    std::cout << "fd " << fd << " 的完整请求内容: \n" << users[fd].buffer << endl;
+
+    // 发送响应
+    const char* response = "HTTP/1.1 200 OK\r\n\r\n<h1>Hello</h1>";
+    send(fd, response, strlen(response), 0);
+
+    // 清空缓冲区
+    users[fd].buffer.clear();
+
+    //重点：重新激活 EPOLLONESHOT，让fd能接收下一次请求
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;
+    ev.data.fd= fd;
+    epoll_ctl(epoll_fd,EPOLL_CTL_MOD,fd,&ev); //用MOD修改状态参数，重新激活ONESHOT
+}
+
+4. 主线程创建线程池
+int main() {
+    // 忽略SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+    threadpool pool(8);
+...
+}
+
+经过这段优化，我终于成功构建了Webserver的基本雏形，具备了一定的工业可用性。
