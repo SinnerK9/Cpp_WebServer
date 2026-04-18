@@ -560,7 +560,7 @@ int main() {
 
 经过这段优化，我终于成功构建了Webserver的基本雏形，具备了一定的工业可用性。
 
-## 2026.4.16
+## 2026.4.16 HTTP报文基础认识
 ### 一、HTTP报文整体基础知识
 HTTP 协议定义了两种报文：请求报文和响应报文）。两者格式都由四部分构成，必须严格按照规范构造，否则将无法正常解析。
 ### 二、HTTP 请求报文
@@ -601,7 +601,7 @@ GET一般没有，POST才有，存放表单、JSON 等提交内容
 服务器给客户端的附加信息，同样是键值对格式。
 常见字段：
 Date：响应时间
-Content-Type：响应内容类型（text/html、image/jpeg 等）
+Content-Type：响应内容类型（text/html、image/jpeg等）
 Content-Length：响应体长度
 Server：服务器信息
 3. 空行
@@ -614,3 +614,30 @@ Server：服务器信息
 请求行不能为空，是解析起点；
 空行不能缺失，否则会导致报文结构解析错误；
 正文长度必须与Content-Length一致，否则会截断或超时。
+
+## 2026.4.17
+实现了基本的server架构之后，为了真正实现一个可用的服务器，我们需要把目光转向应用层协议处理。在现有代码中，为了注重服务器架构本身，我们把业务逻辑简化为输出收到的报文并返回hello，这和实际应用相距甚远！在实际操作中，客户端发送到服务端的是上面所示的请求报文，里面含有请求的类型，服务和支持返回的内容等大量信息，业务逻辑首先要做的就是解析客户端发来的报文，读出其中蕴含的信息。
+有了昨天的前置知识，我们知道请求报文都是按行书写的，首先要做的就是想办法把报文按行解析，不难发现，每一行结束的标志是\r\n，我们可以通过这个标志的出现来判断读完一行！
+
+size_t first_line_end = request.find("\r\n"); 
+利用find函数，我们可以找到第一行结束的位置，再结合substr，这就分割出了第一行。
+    stringstream ss(first_line);
+    string method,url,version;
+    ss >> method >> url >> version;
+
+用stringstream进行简单分割，读出第一行里的三个部分：方法，路径，版本。使用字符串操作组合出本地的文件存储路径。
+stat(filepath.c_str(),&file_stat)使用Linux的stat方法查看路径里是否有所需文件，文件不存在则输出404 Not Found，手动编辑响应报文体。反之只需要发送报文头提示200 OK，用while循环把文件一点一点send过去。
+
+std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(file_stat.st_size) + "\r\n\r\n"; 
+send(fd,header.c_str(),header.size(),0); 
+int src_fd = open(filepath.c_str(),O_RDONLY); 
+char file_buf[1024]; 
+int bytes_read;
+
+while((bytes_read = read(src_fd,file_buf,sizeof(file_buf))) > 0){
+    send(fd,file_buf,bytes_read,0);
+}
+close(src_fd);
+
+
+
