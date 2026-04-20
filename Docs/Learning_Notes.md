@@ -509,7 +509,6 @@ users[curr_fd].buffer.clear();
     }
 break;
 }
-
 记得给每次退出增加清空buffer环节！
 
 #### 线程池 + EPOLLONESHOT，IO与业务解耦
@@ -659,3 +658,91 @@ std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(file
         iv[1].iov_len = file_stat.st_size;
         writev(fd,iv,2); //聚合写：传入客户端socket描述符，iovec数组和要传送的数据块数量
         munmap(file_address, file_stat.st_size); //解除映射，释放资源
+
+## 2026.4.20 主从状态机实现
+为了符合真正的使用场景，我们还需要继续深化解析http报文的逻辑，容易发现，目前的解析逻辑比较简陋，只完成了解析首行的逻辑，暂时没有完成后面的header；并且用stringstream解析每一行有巨大的隐患：一旦发来的报文并不完全（粘包/半包/恶意链接），没有办法解析出三个部分，这可能导致崩溃和越界。并且没有对常见的长连接的支持。
+面对复杂的网络环境，要解决粘包半包等情况，必须保持坚决的按段按行按步解析，要达成这个目的，我们采取的方法是引入**主从状态机**，从状态机只有一个任务：将报文按行切分。真正的解析任务由主状态机完成，其任务是记录当前解析到每一步（Request？Header？Body?），并且按当前状态执行相应的解析逻辑，解析得到的结果决定接下来的操作。
+从状态机的逻辑只需检测\r\n切行即可，为了完成主状态机的解析任务，需要先定义几种不同的解析状态和解析结果。
+enum CHECK_STATE { 
+    CHECK_STATE_REQUESTLINE = 0, //请求行
+    CHECK_STATE_HEADER, //头部
+    CHECK_STATE_CONTENT //请求体
+};
+
+//列举各种解析结果
+enum HTTP_CODE {
+    NO_REQUEST,// 请求不完整，继续读数据
+    GET_REQUEST,// 成功拿到完整 HTTP 请求
+    BAD_REQUEST, // 请求语法错误（400）
+    INTERNAL_ERROR // 服务器内部错误（500）
+};
+我们的客户端连接信息都存在ClientState结构体中，因此其中不仅要有fd和接收缓冲区buffer，还应存储当前的解析状态和解析到的下标位置，方便调用逻辑并进行接下来的解析；同理，解析得到的词条也存储在此。
+
+//从状态机逻辑实现：字符串切分
+std::string get_line(ClientState& client){
+    size_t pos = client.buffer.find("\r\n",client.checked_idx);
+    //没找着行，撤了
+    if(pos == std::string::npos){
+        return "";
+    }
+    std::string line = client.buffer.substr(client.checked_idx,pos - client.checked_idx); //用substr方法将当前行分割出来
+    client.checked_idx = pos + 2; //这行已经切分出来，更新checked_idx，+2跳过\r\n
+    return line;
+}
+
+**主状态机逻辑实现**
+//核心：主状态机逻辑实现
+HTTP_CODE parse_http_request(ClientState& client){
+    std::string line;
+    //循环逻辑：能够读到行 / 读请求体（请求体不一定有换行符）
+    while((line = get_line(client)) != "" || client.check_state == CHECK_STATE_CONTENT){
+
+        switch(client.check_state){
+            case CHECK_STATE_REQUESTLINE:{
+                //正在解析请求行，由于能保证读到了行，可以直接用stringstream
+                std::stringstream ss(line);
+                ss >> client.method >> client.url >> client.version;
+                //格式有错误，请求有问题！
+                if(client.method.empty() || client.url.empty()){
+                    return BAD_REQUEST;
+                }
+                client.check_state = CHECK_STATE_HEADER; //请求行只有一行，读完就更新到请求头了
+                break;
+            }
+            case CHECK_STATE_HEADER:{
+                //注意：请求头和请求体中间必定有一个空行，这可以作为切换状态的判断标准
+                //读不到又分两种情况：这请求报文的请求体就是空的 / 有请求体，但是在空行同样读不到
+                if(line.empty()){
+                    if(client.content_length == 0){
+                        return GET_REQUEST; //没请求体了，已经读完了
+                    }
+                    client.check_state = CHECK_STATE_CONTENT;
+                    break;
+                }
+                //开始解析具体的词条!
+                //是否connection词条？是否长连接？
+                if(line.find("Connection:") != std::string::npos){
+                    if(line.find("keep_alive") != std::string::npos){
+                        client.keep_alive = true;
+                    }
+                }
+                //解析请求体长度
+                if(line.find("Content-Length:")!= std::string::npos){
+                    client.content_length = std::stoi(line.substr(15)); //请求体长度：Content-Length:后面的子字符串转为数字
+                }
+                break;
+            }
+            case CHECK_STATE_CONTENT:{ 
+                //请求体阶段不再按行读取，而是按字节判断
+                //缓冲区里还没处理的字节数大于等于请求体长度，说明确实解析完毕了
+                if(client.buffer.size() - client.checked_idx >= client.content_length){
+                    return GET_REQUEST;
+                }
+                return NO_REQUEST; 
+            }
+            default:
+                return INTERNAL_ERROR; 
+        }
+    }
+    return NO_REQUEST; //连一个完整行都没读到，请求不完整
+}
