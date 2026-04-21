@@ -7,21 +7,64 @@
         body {
             background-color: #f0f0f0;
             text-align: center;
-            padding-top: 80px;
+            padding-top: 50px;
             font-family: Arial, sans-serif;
         }
         h1 {
             color: #2c3e50;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            color: #e74c3c;
+            font-weight: bold;
+            font-size: 20px;
         }
         p {
             color: #34495e;
             font-size: 18px;
         }
+        .image-container {
+            margin-top: 30px;
+            padding: 15px;
+            background: white;
+            display: inline-block;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+        img {
+            max-width: 400px;
+            border-radius: 8px;
+        }
+        .tip {
+            margin-top: 40px;
+            padding: 15px;
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+            border-radius: 8px;
+            display: inline-block;
+            text-align: left;
+        }
     </style>
 </head>
 <body>
-    <h1>恭喜！Web 服务器运行成功 🎉</h1>
-    <p>这是从本地 index.html 读取的页面</p>
-    <p>你的 epoll 服务器已经能正常分发静态文件了！</p>
+    <h1>恭喜！Web 服务器终极进化 🎉</h1>
+    <p class="subtitle">mmap + writev + 状态机解析 + 线程池</p>
+    <p>你的 epoll 服务器不仅能分发网页，还能无缝处理多媒体资源了！</p>
+    
+    <!-- 增加一张图片的请求，用来触发长连接并发 -->
+    <div class="image-container">
+        <p style="margin-top: 0; color: #7f8c8d; font-size: 14px;">下面这张图片是通过同一个 TCP 连接拉取的 👇</p>
+        <img src="/test.jpg" alt="测试图片">
+    </div>
+
+    <div class="tip">
+        <strong>🔍 终端观察指南：</strong><br>
+        现在请去看看你运行 C++ 服务器的终端！<br>
+        你应该会看到同一个文件描述符 (fd) 连续输出了两条日志：<br>
+        1. 方法:GET 路径:<code>/index.html</code> 协议:HTTP/1.1 长连接:1<br>
+        2. 方法:GET 路径:<code>/test.jpg</code> 协议:HTTP/1.1 长连接:1<br>
+        <em>这就是 HTTP/1.1 Keep-Alive 带来的网络复用魔法！</em>
+    </div>
 </body>
 </html>

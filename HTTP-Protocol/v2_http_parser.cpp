@@ -5,9 +5,9 @@
 #include <unistd.h>
 #include <iostream>
 #include <sys/epoll.h>
-#include <fcntl.h> //优化1：用于设置非阻塞的头文件
+#include <fcntl.h> 
 #include <errno.h>
-#include <signal.h> //优化4：用于设置忽略SIGPIPE逻辑 
+#include <signal.h>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -135,28 +135,32 @@ struct ClientState {
         checked_idx = 0;
         keep_alive = false;
         content_length = 0;
+        method.clear();
+        url.clear();
+        version.clear();
     }
 };
 ClientState users[65536];
 
 
-//从状态机逻辑实现：字符串切分
-std::string get_line(ClientState& client){
-    size_t pos = client.buffer.find("\r\n",client.checked_idx);
-    //没找着行：返回空行
-    if(pos == std::string::npos){
-        return "";
+// 从状态机逻辑实现：字符串切分（改为返回 bool）
+bool get_line(ClientState& client, std::string& line) {
+    size_t pos = client.buffer.find("\r\n", client.checked_idx);
+    // 没找着换行符：返回 false，表示请求还没收全
+    if (pos == std::string::npos) {
+        return false;
     }
-    std::string line = client.buffer.substr(client.checked_idx,pos - client.checked_idx); //用substr方法将当前行分割出来
-    client.checked_idx = pos + 2; //这行已经切分出来，更新checked_idx，+2跳过\r\n
-    return line;
+    // 找到了！把这一行切出来
+    line = client.buffer.substr(client.checked_idx, pos - client.checked_idx); 
+    client.checked_idx = pos + 2; //跳过 \r\n
+    return true;
 }
 
 //核心：主状态机逻辑实现
 HTTP_CODE parse_http_request(ClientState& client){
     std::string line;
     //循环逻辑：能够读到行 / 读请求体（请求体不一定有换行符）
-    while((line = get_line(client)) != "" || client.check_state == CHECK_STATE_CONTENT){
+    while( get_line(client,line) || client.check_state == CHECK_STATE_CONTENT){
 
         switch(client.check_state){
             case CHECK_STATE_REQUESTLINE:{
@@ -183,7 +187,7 @@ HTTP_CODE parse_http_request(ClientState& client){
                 //开始解析具体的词条!
                 //是否connection词条？是否长连接？
                 if(line.find("Connection:") != std::string::npos){
-                    if(line.find("keep_alive") != std::string::npos){
+                    if(line.find("keep-alive") != std::string::npos){
                         client.keep_alive = true;
                     }
                 }
@@ -217,50 +221,72 @@ int setnonblocking(int fd){
 }
 
 void handle_client(int fd,int epoll_fd){
-    std::string& request = users[fd].buffer;
-    size_t first_line_end = request.find("\r\n");  //利用find函数和每行末尾特征将第一行找出来！
-    if(first_line_end == string::npos) return; //string::pos表示no position（没有找到期望位置），请求可能不完整
-    string first_line = request.substr(0, first_line_end); //提取出第一行
-    stringstream ss(first_line);
-    string method,url,version; //用stringstream进行最简单的分割，用空格将第一行分割为请求方法/资源地址/http版本
-    ss >> method >> url >> version;
-    std::cout << "[解析请求] 方法:" << method << " 路径:" << url << " 协议:" << version << std::endl;
-    //判断请求的路径是什么，给出相应的响应
-    if(url == "/"){
-        url = "/index.html"; //默认主页
-    }
-    std::string filepath = "./resources" + url; //要读的东西都存在resources，拼出路径
-    struct stat file_stat;
-    //使用stat方法查询相应路径文件是否存在，注意path方法不接受string，需要转化为char*
-    if(stat(filepath.c_str(),&file_stat) < 0){
-        std::string body = "<h1>404 Not Found</h1>";
-        std::string header = "HTTP/1.1 404 Not Found\r\nContent-Length: " + std::to_string(file_stat.st_size) + "\r\n\r\n";
-        send(fd,header.c_str(),header.size(),0); 
-        send(fd,body.c_str(),body.size(),0);
-    }else{
-        std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(file_stat.st_size) + "\r\n\r\n"; //stat返回=0，找到了
-        int src_fd = open(filepath.c_str(),O_RDONLY); //READ_ONLY打开
-        //进行内存映射。传入参数：映射虚拟内存地址（NULL自动分配），映射内存长度，映射权限（只读），映射类型（私有映射），映射的文件描述符，文件偏移量（0表示开头开始映射）
-        //返回值是映射后的内存首地址，直接靠这个地址即可访问文件
-        char* file_address = (char*) mmap(NULL,file_stat.st_size,PROT_READ,MAP_PRIVATE,src_fd,0);
-        close(src_fd); //mmap建立后不需要文件描述符了，关掉释放资源
+    ClientState& client = users[fd];
+    HTTP_CODE ret = parse_http_request(client);
+    //请求尚不完整，回去重新recv！需要重置EPOLLONESHOT
+    if(ret == NO_REQUEST){
+        struct epoll_event ev;
+        ev.data.fd = fd;
+        ev.events = EPOLLIN | EPOLLONESHOT | EPOLLRDHUP |EPOLLET;
+        epoll_ctl(epoll_fd,EPOLL_CTL_MOD,fd,&ev);
+        return;
+    //请求语法有问题，关闭连接
+    }else if(ret == BAD_REQUEST){
+        std::string response;
+        response = "HTTP/1.1 400 Bad Request\r\nContent-Length: " + std::to_string(strlen("Bad Request")) + "\r\n\r\n";
+        send(fd,response.c_str(),response.size(),0);
+        close(fd);
+        return;
+    }else if(ret == GET_REQUEST){
+        std::cout << "方法为： " << client.method << "  路径为： " << client.url << " 版本为： " << client.version << " 长连接： " << client.keep_alive << std::endl;
+        if(client.url == "/"){
+            client.url = "/index.html"; 
+        }
+        std::string filepath = "./resources" + client.url; 
+        struct stat file_stat;
+        if(stat(filepath.c_str(),&file_stat) < 0){
+            std::string body = "<h1>404 Not Found</h1>";
+            std::string header = "HTTP/1.1 404 Not Found\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+            send(fd,header.c_str(),header.size(),0); 
+            send(fd,body.c_str(),body.size(),0);
+        }else{
+            std::string header = "HTTP/1.1 200 OK\r\n";
+            //是否为长连接？将这部分信息在响应头中传出去
+            if(client.keep_alive == true){
+                header +=  "Connection: keep-alive\r\n";
+            }else{
+                header += "Connection: close\r\n";
+            }
+            if(client.url.find(".jpg") != std::string::npos || client.url.find(".png") != std::string::npos) {
+                header += "Content-Type: image/jpeg\r\n"; // 图片类型
+            } else {
+                header += "Content-Type: text/html; charset=utf-8\r\n"; // 网页类型
+            }
+            header += "Content-Length: "+ std::to_string(file_stat.st_size) + "\r\n\r\n"; //stat返回=0，找到了
+            int src_fd = open(filepath.c_str(),O_RDONLY); 
+            char* file_address = (char*) mmap(NULL,file_stat.st_size,PROT_READ,MAP_PRIVATE,src_fd,0);
+            close(src_fd); 
+            struct iovec iv[2];
+            iv[0].iov_base = (void*)header.c_str(); 
+            iv[0].iov_len = header.size();
+            iv[1].iov_base = file_address;
+            iv[1].iov_len = file_stat.st_size;
+            writev(fd,iv,2); 
+            munmap(file_address, file_stat.st_size); 
+        }//对于长连接：不断掉连接，重新将其初始化清空，激活EPOLLONESHOT
+        if(client.keep_alive){
+            client.init(fd);
+            struct epoll_event ev;
+            ev.data.fd = fd;
+            ev.events = EPOLLIN | EPOLLONESHOT | EPOLLRDHUP |EPOLLET;
+            epoll_ctl(epoll_fd,EPOLL_CTL_MOD,fd,&ev);
+        }else{
+            //不是长连接，从事件表里删去，关闭文件描述符
+            epoll_ctl(epoll_fd,EPOLL_CTL_DEL,fd,NULL);
+            close(fd);
+        }
 
-        //writev专用的数据块描述结构体，描述不连续内存，包含内存首地址和数据长度
-        struct iovec iv[2];
-        iv[0].iov_base = (void*)header.c_str(); //第一块内存：响应头
-        iv[0].iov_len = header.size();
-        iv[1].iov_base = file_address; //第二块内存：mmap出的内容
-        iv[1].iov_len = file_stat.st_size;
-
-        writev(fd,iv,2); //聚合写：传入客户端socket描述符，iovec数组和要传送的数据块数量
-        munmap(file_address, file_stat.st_size); //解除映射，释放资源
     }
-    //清空buffer，重置EPOLLONESHOT
-    users[fd].buffer.clear(); 
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT| EPOLLRDHUP;  
-    ev.data.fd= fd;
-    epoll_ctl(epoll_fd,EPOLL_CTL_MOD,fd,&ev); 
 }
 
 int main() {
@@ -342,8 +368,7 @@ int main() {
                         break;
                     }
                     setnonblocking(client_fd);
-                    users[client_fd].fd = client_fd; 
-                    users[client_fd].buffer = ""; 
+                    users[client_fd].init(client_fd);
                     std::cout << "新连接：" << client_fd << std::endl;
                     std::cout << "新连接IP:" << inet_ntoa(client_addr.sin_addr) << std::endl;
                     struct epoll_event client_ev;
@@ -370,6 +395,11 @@ int main() {
                         if(errno == EAGAIN||errno == EWOULDBLOCK){
                             if(!users[curr_fd].buffer.empty()){
                             pool.submit(handle_client,curr_fd,epoll_fd);                    
+                            }else{
+                                struct epoll_event ev;
+                                ev.data.fd = curr_fd;
+                                ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT;
+                                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, curr_fd, &ev);
                             }
                             break;
                         }

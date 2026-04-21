@@ -659,7 +659,7 @@ std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(file
         writev(fd,iv,2); //聚合写：传入客户端socket描述符，iovec数组和要传送的数据块数量
         munmap(file_address, file_stat.st_size); //解除映射，释放资源
 
-## 2026.4.20 主从状态机实现
+## 2026.4.20-4.21 主从状态机实现
 为了符合真正的使用场景，我们还需要继续深化解析http报文的逻辑，容易发现，目前的解析逻辑比较简陋，只完成了解析首行的逻辑，暂时没有完成后面的header；并且用stringstream解析每一行有巨大的隐患：一旦发来的报文并不完全（粘包/半包/恶意链接），没有办法解析出三个部分，这可能导致崩溃和越界。并且没有对常见的长连接的支持。
 面对复杂的网络环境，要解决粘包半包等情况，必须保持坚决的按段按行按步解析，要达成这个目的，我们采取的方法是引入**主从状态机**，从状态机只有一个任务：将报文按行切分。真正的解析任务由主状态机完成，其任务是记录当前解析到每一步（Request？Header？Body?），并且按当前状态执行相应的解析逻辑，解析得到的结果决定接下来的操作。
 从状态机的逻辑只需检测\r\n切行即可，为了完成主状态机的解析任务，需要先定义几种不同的解析状态和解析结果。
@@ -676,8 +676,20 @@ enum HTTP_CODE {
     BAD_REQUEST, // 请求语法错误（400）
     INTERNAL_ERROR // 服务器内部错误（500）
 };
-我们的客户端连接信息都存在ClientState结构体中，因此其中不仅要有fd和接收缓冲区buffer，还应存储当前的解析状态和解析到的下标位置，方便调用逻辑并进行接下来的解析；同理，解析得到的词条也存储在此。
+我们的客户端连接信息都存在ClientState结构体中，因此其中不仅要有fd和接收缓冲区buffer，还应存储当前的解析状态和解析到的下标位置，方便调用逻辑并进行接下来的解析；同理，解析得到的词条也存储在此，这个类中需要新的**初始化逻辑**：
+ void init(int client_fd){
+        fd = client_fd;
+        buffer.clear();
+        check_state = CHECK_STATE_REQUESTLINE;
+        checked_idx = 0;
+        keep_alive = false;
+        content_length = 0;
+        method.clear();
+        url.clear();
+        version.clear();
+    }
 
+**主从状态机逻辑实现**
 //从状态机逻辑实现：字符串切分
 std::string get_line(ClientState& client){
     size_t pos = client.buffer.find("\r\n",client.checked_idx);
@@ -690,7 +702,6 @@ std::string get_line(ClientState& client){
     return line;
 }
 
-**主状态机逻辑实现**
 //核心：主状态机逻辑实现
 HTTP_CODE parse_http_request(ClientState& client){
     std::string line;
@@ -736,13 +747,56 @@ HTTP_CODE parse_http_request(ClientState& client){
                 //请求体阶段不再按行读取，而是按字节判断
                 //缓冲区里还没处理的字节数大于等于请求体长度，说明确实解析完毕了
                 if(client.buffer.size() - client.checked_idx >= client.content_length){
-                    return GET_REQUEST;
+                 return GET_REQUEST;
                 }
                 return NO_REQUEST; 
             }
             default:
-                return INTERNAL_ERROR; 
+                return INTERNAL_ERROR; //啥都不是？那就是未知内部错误！
         }
     }
     return NO_REQUEST; //连一个完整行都没读到，请求不完整
 }
+
+## 将主从状态机逻辑集成到处理函数中
+在处理函数(Handle_Client())中对于主状态机返回的各种处理状态，跳转到对应的处理逻辑：
+NO_REQUEST:请求不完整，更新事件属性（重置EPOLLONESHOT）让它回去重新recv。
+BAD_REQUEST:请求语法有问题，不可能解析，直接断掉链接！
+GET_REQUEST:收到完整请求，可以进行解析和响应。执行上一步已经完成的文件服务逻辑，并且增加对是否长连接(keep-alive)的判断，若为长连接则在服务后先不断连接，只需进行初始化重置；否则直接关闭连接删除事件。
+
+**其他优化**
+
+1：问题产生：完成前面的代码后，我在用浏览器访问的过程中发现一直重复卡在正在加载，无法进入预设的页面。经过反复排查，最后将问题锁定在前面实现的get_line逻辑：
+std::string get_line(ClientState& client){
+    size_t pos = client.buffer.find("\r\n",client.checked_idx);
+    if(pos == std::string::npos){
+        return "";
+    }
+    std::string line = client.buffer.substr(client.checked_idx,pos - client.checked_idx); 
+    client.checked_idx = pos + 2
+    return line;
+}
+考虑http报文中空行的判断：其可能是在请求头和请求体之间的空行，也可能是请求真的不完整，但是全都返回了""。产生混淆导致跳进了NO_REQUEST，永远不可能发送响应！因此我将读行和判断分开，重写从状态机的逻辑：
+bool get_line(ClientState& client, std::string& line) {
+    size_t pos = client.buffer.find("\r\n", client.checked_idx);
+    // 没找着换行符：返回 false，表示请求还没收全
+    if (pos == std::string::npos) {
+        return false;
+    }
+    //
+    line = client.buffer.substr(client.checked_idx, pos - client.checked_idx); 
+    client.checked_idx = pos + 2; //跳过 \r\n
+    return true;
+}
+用两种方法共同确定状态：是否成功读到？（有无\r\n）读到的是什么？
+false就跳到NO_REQUEST，true则进入判断：非空正常解读，空行则切换解析状态至读请求体。
+
+2：在接收到新连接后，先对新连接进行初始化。
+3：增加新的情况：在网页中加入测试图片test.jpg，增加content-type判断逻辑
+if(client.url.find(".jpg") != std::string::npos || client.url.find(".png") != std::string::npos) {
+                header += "Content-Type: image/jpeg\r\n"; // 图片类型
+            } else {
+                header += "Content-Type: text/html; charset=utf-8\r\n"; // 网页类型
+            }
+优化之后，网页可以显示指定的照片test.jpg了！
+4：在观察终端过程中，发现有额外请求favicon.ico，查询资料后发现这是网页图标的请求，因此增加了一个图标文件，并且学习了如何禁用网页缓存。
