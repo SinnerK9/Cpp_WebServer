@@ -17,7 +17,7 @@ private:
 
     MYSQL* create_conn(){
         MYSQL* conn = mysql_init(NULL); //空的MySQL连接对象
-        //将其连接上3306端口(MySQL固定端口)，本地的webserver数据库，账号密码为webserver/123456
+        //将其连接上3306端口(MySQL固定端口)，本地的webserver数据库，账号密码为root/123456
         if(!mysql_real_connect(conn,"localhost","root","123456","webserver",3306,NULL,0)){
             std::cout << "MySQL连接失败: " << mysql_error(conn) << std::endl; 
             return NULL;
