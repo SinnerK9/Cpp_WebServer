@@ -758,7 +758,7 @@ HTTP_CODE parse_http_request(ClientState& client){
     return NO_REQUEST; //连一个完整行都没读到，请求不完整
 }
 
-## 将主从状态机逻辑集成到处理函数中
+### 将主从状态机逻辑集成到处理函数中
 在处理函数(Handle_Client())中对于主状态机返回的各种处理状态，跳转到对应的处理逻辑：
 NO_REQUEST:请求不完整，更新事件属性（重置EPOLLONESHOT）让它回去重新recv。
 BAD_REQUEST:请求语法有问题，不可能解析，直接断掉链接！
@@ -800,3 +800,5 @@ if(client.url.find(".jpg") != std::string::npos || client.url.find(".png") != st
             }
 优化之后，网页可以显示指定的照片test.jpg了！
 4：在观察终端过程中，发现有额外请求favicon.ico，查询资料后发现这是网页图标的请求，因此增加了一个图标文件，并且学习了如何禁用网页缓存。
+
+## 2026.4.22 集成MySQL实现账号注册登录
