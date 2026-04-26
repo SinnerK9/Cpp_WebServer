@@ -876,3 +876,134 @@ if(client.method == "POST" && client.url == "/login"){
             send_login_response(fd,if_login);
         }
 '''
+
+## 2026.4.24-4.26 架构重构
+到目前为止我们可以说基本实现了这个服务器的架构，但是观察现在的代码，几乎所有的代码都集成在一个cpp中，暴露出大量的底层系统调用，这严重影响了代码的可读性和可维护性！理想的工程代码应当是结构化的，模块化的。在这个思想的指导下，我们需要将整个代码进行重构。
+先对最显著的两个单独模块进行重构：MySQLPool和ThreadPool。
+
+### MySQLPool重构
+将原有的MySQLPool.h进行优化拆分为MySQLPool.h和MySQLPool.cpp，独立出一个MySQL_Pool模块，并且对其中不够工程化的部分进行重构！
+
+#### 整体架构优化
+新增了一个空闲连接队列conn_queue，以及用来管理索要连接的工作线程的条件变量cond_。这样的优化为后续优化打好了基础。
+
+#### get_conn()方法重构
+观察原来的MySQL_Pool.h代码get_conn方法：
+'''
+MYSQL* get_conn(){
+        std::lock_guard<std::mutex> lock(mtx);
+        if(pool.empty()){
+            return NULL;
+        }
+        MYSQL* conn = pool.front();
+        pool.pop();
+        return conn;
+}
+'''
+当连接池中没有足够连接时，会返回NULL：考虑这样的一个场景，总共有11个连接同时要求登录，前十个成功拿到MySQL连接，剩下的一个返回NULL，check_login直接显示登录失败，只因为数据库忙就不让用户登录是不合理的。因此我们对原有逻辑进行改造：
+'''
+//等待空闲连接，最多等 500ms
+    if (conn_queue_.empty()) {
+        cond_.wait_for(lock, std::chrono::milliseconds(500),
+                       [this] { return !conn_queue_.empty(); });
+    }
+    if (conn_queue_.empty()) {
+    //超时！实在没有返回来的空闲连接
+    std::cerr << "[MySQLPool] No idle connection available!" << std::endl;
+    return nullptr;
+    }
+'''
+如果请求连接的时候暂时没有空闲连接，支持工作线程等待500ms来等待其他用户用完链接归还，其他用户归还时条件变量会唤醒一个正在进行阻塞等待新连接的工作线程。如果过了500ms依旧没有空闲连接，输出相应的信息提示连接不足，数据库忙。
+
+#### 增加析构方法
+原来的连接池类缺乏析构方法，创建完的MySQL连接完全没有销毁！这带来了潜在的资源泄露风险：
+当主线程退出，服务器不工作的时候，连接池中所有的MySQL指针丢失，但是MySQL服务端并不清楚这个情况，因此会一直保留连接，由于MySQL其实存在一个max_connection(一般为151)，一旦服务器反复开关，这些僵尸连接就会占住max_connection，最终影响正常连接！
+增加对mysql_close的调用和析构函数的定义：
+'''
+void MySQLPool::destroy_conn_(MYSQL* conn) {
+    if (conn != nullptr) {
+        mysql_close(conn);
+    }
+}
+
+MySQLPool::~MySQLPool() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    while (!conn_queue_.empty()) {
+        MYSQL* conn = conn_queue_.front();
+        conn_queue_.pop();
+        destroy_conn_(conn);
+    }
+    current_size_ = 0;
+}
+'''
+
+#### RAII思想重构：新增Connguard类，保证每一个连接都被归还
+新增一个ConnGuard类，用来保证每一个取到的连接最终都被归还到连接池中国
+'''
+class ConnGuard {
+public:
+    ConnGuard() : conn_(MySQLPool::get_instance()->get_conn()) {}
+    ~ConnGuard() {
+        if (conn_) {
+            MySQLPool::get_instance()->return_conn(conn_);
+        }
+    }
+
+    MYSQL* conn() { return conn_; }
+    operator bool() const { return conn_ != nullptr; }
+
+    // 禁止拷贝
+    ConnGuard(const ConnGuard&) = delete;
+    ConnGuard& operator=(const ConnGuard&) = delete;
+
+private:
+    MYSQL* conn_;
+};
+'''
+当构造一个ConnGuard类对象的时候，会自动调用get_conn函数得到一个连接，可以通过conn()接口访问它，重载()返回bool用于确定有没有实际取到连接。禁止拷贝，一个连接只能由一个守卫管理，否则同一个连接return两次会出现野指针问题。最关键的是，**ConnGuard类对象在离开自己的作用域会自动调用析构函数，意味着必然会自动return_conn。**
+
+还有其他较小的优化，如新增查询函数,以及新增对断开连接的自动重连，防止取到的连接没办法访问数据库。
+
+### Thread_Pool优化
+Thread_Pool没有太多的优化，主要是一些命名规范和细枝末节的修改。如在成员变量后增加_，
+
+#### 提取worker_loop
+将threadpool构造函数中的一大段lambda表达式提取出来成为独立的循环逻辑，有利于维护，测试，也让代码更具有可读性
+'''
+void worker_loop_() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            condition_.wait(lock, [this] {
+                return stop_ || !tasks_.empty();
+            });
+            if (stop_ && tasks_.empty()) return;
+            task = std::move(tasks_.front());
+            tasks_.pop();
+        }
+        task();
+        pending_tasks_--;
+    }
+}
+'''
+
+#### 禁止隐式类型转换和拷贝
+'''
+explicit ThreadPool(size_t num_threads);  // 防止隐式转换
+ThreadPool(const ThreadPool&) = delete;   // 禁止拷贝
+ThreadPool& operator=(const ThreadPool&) = delete;
+'''
+增加explicit，防止通过隐式类型转换产生多个Threadpool对象管理同一个线程，导致双重析构最终崩溃。
+
+#### 增加查询接口
+'''
+size_t pending_count() const {
+    return pending_tasks_.load(std::memory_order_relaxed);
+}
+
+size_t thread_count() const {
+    return workers_.size();
+}
+'''
+有利于查询线程池目前积压了多少任务，对后续的开发有帮助。
