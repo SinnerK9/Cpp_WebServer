@@ -69,23 +69,14 @@ void HttpConn::reset() {
     m_post_data.clear();
     m_bytes_to_send  = 0;
     m_bytes_have_send = 0;
-    m_iv_count       = 0;
+    m_iv_count = 0;
     memset(m_iv, 0, sizeof(m_iv));
 
     // 注意：m_mmap_addr 的释放在 unmap() 中，不在这里
 }
 
-// ============================================================
-// close_conn() — 优雅关闭
-// ============================================================
-/*
- * 为什么在 HttpConn？
- *   → 需要清理 m_mmap_addr（HttpConn 的资源）
- *   → 需要关闭 m_sockfd（HttpConn 的资源）
- *   → 需要从 epoll 注销（使用 HttpConn::m_epollfd）
- *   → WebServer 只需要说"这个连接可以关了"，不需要知道怎么关
- *   → Epoller 未来可以提供 del_fd() 方法让这里更干净
- */
+
+// close_conn():统一关闭接口
 void HttpConn::close_conn(bool real_close) {
     if (real_close && m_sockfd != -1) {
         epoll_ctl(m_epollfd, EPOLL_CTL_DEL, m_sockfd, nullptr);
@@ -96,14 +87,7 @@ void HttpConn::close_conn(bool real_close) {
     unmap();  // 释放 mmap（不论是否 real_close，都要释放）
 }
 
-// ============================================================
-// unmap() — 释放 mmap 映射
-// ============================================================
-/*
- * 为什么在 HttpConn？
- *   → m_mmap_addr 和 m_file_stat 都是 HttpConn 的私有数据
- *   → 只有 HttpConn 知道什么时候映射还在用、什么时候该释放
- */
+//unmap():释放内存映射
 void HttpConn::unmap() {
     if (m_mmap_addr) {
         munmap(m_mmap_addr, m_file_stat.st_size);
@@ -111,23 +95,7 @@ void HttpConn::unmap() {
     }
 }
 
-// ============================================================
-// read() — ET 模式循环读取
-// ============================================================
-/*
- * ★ 为什么在 HttpConn 而不是 WebServer？
- *    → WebServer 如果直接 recv()，它就要知道 m_read_buf 的内部格式
- *    → 如果以后改成环形缓冲区或双缓冲，要改 WebServer —— 这就是耦合
- *    → HttpConn 封装了"怎么读"，WebServer 只需要知道"读完了吗"
- *
- * ★ 为什么在 HttpConn 而不是 Epoller？
- *    → Epoller 的职责是"这个 fd 可读了"，怎么读、读到哪，它不管
- *    → Epoller 是安保部门，不是服务员。保安不会帮你端盘子。
- *
- * ★ 返回值含义：
- *    true  → 读到了数据，可以交给 process() 了
- *    false → 对端关闭 (byte_read == 0) 或出错
- */
+// read():循环读取
 bool HttpConn::read() {
     // ET 模式：必须循环读直到 EAGAIN，否则可能丢失事件
     while (true) {
