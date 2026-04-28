@@ -1244,3 +1244,245 @@ void HttpConn::close_conn(bool real_close) {
     unmap();  //无论如何都要释放mmap
 }
 
+### WebServer类
+Webserver类是服务器中最核心的模块，是整个项目的核心骨架，真正将所有的零散模块(HttpConn,Epoller,ThreadPool...)整合在一起，统一管理，有序调度。使得它们组成一个高性能服务器。
+WebServer类掌握着整个通信架构中最核心的资源，listen_fd必须由它初始化并管理，epoller实例监听事件发生，执行epoll_wait提醒线程工作，用users_[]全局数组管理所有HttpConn，用线程池分配业务线程。
+
+#### 构造/析构
+这部分包含原代码main函数的前部分，即对服务器的开机初始化：设定端口号，初始化一个指定数量的线程池，创建epoll监听实例合客户端连接数组，监听socket暂未创建，初始为停止状态，并设定忽略SIGPIPE。
+**关键设计：给HttpConn分配了静态成员变量m_epollfd，允许直接用epoll操作修改事件，不必每次传递**
+析构时，设定服务器停止，关闭监听socket，删除全局数组防止泄露
+'''
+WebServer::WebServer(int port, int thread_num)
+    : port_(port)
+    , listen_fd_(-1)
+    , is_running_(false)
+    , epoller_(MAX_EVENTS)//Epoller最多返回 1024 个事件
+    , thread_pool_(thread_num)//创建线程池
+    , users_(new HttpConn[MAX_FD]) //堆分配连接数组
+{
+    HttpConn::m_epollfd = epoller_.epoll_fd();
+    init_signal_(); //设置忽略SIGPIPE
+}
+
+WebServer::~WebServer() {
+    stop();
+    if (listen_fd_ >= 0) {
+        close(listen_fd_);
+    }
+    delete[] users_;
+}
+
+'''
+
+#### 初始化listen socket
+listen socket是整个服务器最重要的资源，所有的连接都需要经过listen socket，由webserver掌管，进行初始化：创建，绑定IP和端口，监听，以及必要的SO_REUSEADDR，set_nonblocking，并注册到Epoller，让内核监听新连接。
+'''
+bool WebServer::init_socket_() {
+    // ---- 1. socket ----
+    listen_fd_ = socket(PF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) {
+        perror("WebServer: socket() failed");
+        return false;
+    }
+
+    //设为非阻塞（ET 模式要求），复用 HttpConn 的静态工具方法
+    HttpConn::set_nonblocking(listen_fd_);
+
+    //SO_REUSEADDR：重启后立即复用端口
+    int opt = 1;
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    //bind
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons(port_);
+    if (bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("WebServer: bind() failed");
+        close(listen_fd_);
+        return false;
+    }
+
+    //listen
+    if (listen(listen_fd_, 5) < 0) {
+        perror("WebServer: listen() failed");
+        close(listen_fd_);
+        return false;
+    }
+
+    //注册到 Epoller:注意要反复用，不能EPOLLONESHOT
+    epoller_.add_fd(listen_fd_, EPOLLIN | EPOLLET | EPOLLRDHUP);
+    std::cout << "[WebServer] Listening on port " << port_
+              << " (Reactor Mode, " << "ET + ThreadPool)" << std::endl;
+    return true;
+}
+'''
+
+#### start():真正的事件循环，处理切分
+start()方法是真正的事件循环，整个服务器的底层调度逻辑，决定了什么事件交给谁处理，而不必关心底层的处理细节。
+观察原来的while(true)内代码，服务器无事的时候都在epoll_wait监控文件描述符，遍历所有就绪事件进行分发：
+1：是新连接 ->listenfd有响应。进入handle_listen逻辑：accept，设置非阻塞，加入客户端连接数组，注册Epoller
+2：连接挂了 ->就绪事件的events里有异常标志，进入handle_close逻辑：把事件从Epoller里除去，关闭文件描述符
+3：数据来了 ->就绪事件的events里有EPOLLIN，进入handle_read逻辑
+4：能发数据 ->就绪事件的events里有EPOLLOUT，进入handle_write逻辑。
+'''
+void WebServer::start() {
+    if (!init_socket_()) {
+        std::cerr << "[WebServer] Socket initialization failed!" << std::endl;
+        return;
+    }
+    is_running_ = true;
+    std::cout << "[WebServer] Reactor event loop started." << std::endl;
+
+    //REACTOR主循环
+    while (is_running_) {
+        int n = epoller_.wait(-1);  //阻塞等待事件
+
+        if (n < 0) {
+            if (errno == EINTR) continue;  //被信号中断，重试
+            perror("WebServer: epoll_wait error");
+            break;
+        }
+
+        //遍历所有就绪事件
+        for (int i = 0; i < n; i++) {
+            int fd = epoller_.get_event_fd(i);
+            uint32_t events = epoller_.get_events(i);
+
+            //新连接
+            if (fd == listen_fd_) {
+                handle_listen_();
+                continue;
+            }
+
+            //连接异常（对端关闭/RST/错误）
+            if (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                handle_close_(fd);
+                continue;
+            }
+
+            //数据可读
+            if (events & EPOLLIN) {
+                handle_read_(fd);
+                continue;
+            }
+            //可写（响应已生成，等待发送）
+            if (events & EPOLLOUT) {
+                handle_write_(fd);
+                continue;
+            }
+        }
+    }
+    std::cout << "[WebServer] Reactor event loop stopped." << std::endl;
+}
+'''
+
+#### 事件循环的处理逻辑：listen/close/read/write
+**listen：注意ET模式规定的循环accept，一次性全部接收直到这批连接接受完，让HttpConn初始化，后续的解析交给它。**
+'''
+void WebServer::handle_listen_() {
+    while (true) {
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+        int client_fd = accept(listen_fd_,
+                               (struct sockaddr*)&client_addr,
+                               &client_addr_len);
+
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                //没有更多连接了，退出循环
+                break;
+            }
+            perror("WebServer: accept() error");
+            break;
+        }
+
+        // 交给 HttpConn 初始化（"服务员，去接待这位客人"）
+        add_client_(client_fd, client_addr);
+    }
+}
+
+void WebServer::add_client_(int fd, const sockaddr_in& addr) {
+    if (fd >= MAX_FD) {
+        std::cerr << "[WebServer] Too many connections, close fd: " << fd << std::endl;
+        close(fd);
+        return;
+    }
+    users_[fd].init(fd, addr);
+
+    std::cout << "[WebServer] New connection: fd=" << fd
+              << " IP=" << users_[fd].get_ip()
+              << " Port=" << users_[fd].get_port()
+              << " Total=" << HttpConn::m_user_count << std::endl;
+}
+'''
+
+**read:处理客户端读事件**
+注意：read操作在主线程做，而后面的解析和响应流程process()在线程池中完成：
+'''
+void WebServer::handle_read_(int fd) {
+    HttpConn& conn = users_[fd];
+    //从socket读数据到m_read_buf
+    if (!conn.read()) {
+        // read() 返回 false → 对端关闭或出错
+        handle_close_(fd);
+        return;
+    }
+    //读到数据了，解析和响应让线程池里的工作线程干
+    thread_pool_.submit([this, fd]() {
+        users_[fd].process();
+    });
+}
+原因是：EPOLLIN触发时，数据必须尽快读完，否则ET不会再触发通知，read()这种轻量的I/O操作可以由主线程完成，但是解析和响应是CPU密集型操作，需要消耗几十ms，在主线程完成process()会导致其他连接得不到响应！
+
+**write:处理客户端写事件**
+write操作也在主线程中完成：由于EPOLLONESHOT的存在，以及主线程已经执行过process()，将write放在主线程中可以避免竞争，避免了加锁需求。
+'''
+void WebServer::handle_write_(int fd) {
+    HttpConn& conn = users_[fd];
+
+    if (conn.write()) {
+        //发送完成
+        if (conn.is_keep_alive()) {
+            //keep-alive：重置状态，继续监听下一个请求
+            conn.reset();
+            epoller_.mod_fd(fd, EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT);
+        } else {
+            //短连接：关闭
+            handle_close_(fd);
+        }
+    } else {
+        //还没发完，重新注册EPOLLOUT
+        epoller_.mod_fd(fd, EPOLLOUT | EPOLLET | EPOLLRDHUP | EPOLLONESHOT);
+    }
+}
+'''
+handle_write()的设计方法联系到HttpConn中定义的write方法：前面的优化使得当缓冲区已满而响应未发完的时候会返回false，监测到false则进行重新注册事件，等待下一次EPOLLOUT，防止由于EPOLLONESHOT限制无法再对EPOLLOUT做出响应。
+
+**close:关闭连接**
+'''
+void WebServer::handle_close_(fd) {
+    std::cout << "[WebServer] Closing fd: " << fd << std::endl;
+    users_[fd].close_conn(true);
+}
+'''
+
+### main.cpp：启动器
+所有的操作已被封装入各自的类中，main成为一个纯粹的程序入口，只需创建服务器并启动。
+'''
+#include "WebServer/WebServer.h"
+#include "MySQL_Pool/MySQL_Pool.h"
+
+int main() {
+    //初始化MySQL连接池（单例，提前触发构造）
+    MySQLPool::get_instance();
+
+    //启动服务器：端口8080，8个工作线程
+    WebServer server(8080, 8);
+    server.start();
+
+    return 0;
+}
+'''
