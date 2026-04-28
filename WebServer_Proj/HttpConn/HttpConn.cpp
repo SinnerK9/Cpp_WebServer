@@ -38,6 +38,10 @@ const char* HttpConn::get_ip() const {
     return ip;
 }
 
+int HttpConn::get_port() const {
+    return ntohs(m_addr.sin_port);
+}
+
 //init()：接纳一个新连接
 //init()的特殊之处：需要用到epoll_ctl操作，但是m_sockfd和m_addr都是httpconn持有的内容
 void HttpConn::init(int sockfd, const sockaddr_in& addr) {
@@ -72,9 +76,8 @@ void HttpConn::reset() {
     m_iv_count = 0;
     memset(m_iv, 0, sizeof(m_iv));
 
-    // 注意：m_mmap_addr 的释放在 unmap() 中，不在这里
+    //m_mmap_addr的释放独立到unmap()中
 }
-
 
 // close_conn():统一关闭接口
 void HttpConn::close_conn(bool real_close) {
@@ -84,7 +87,7 @@ void HttpConn::close_conn(bool real_close) {
         m_sockfd = -1;
         m_user_count--;
     }
-    unmap();  // 释放 mmap（不论是否 real_close，都要释放）
+    unmap();  //释放mmap（不论是否 real_close，都要释放）
 }
 
 //unmap():释放内存映射
@@ -97,7 +100,7 @@ void HttpConn::unmap() {
 
 // read():循环读取
 bool HttpConn::read() {
-    // ET 模式：必须循环读直到 EAGAIN，否则可能丢失事件
+    //ET 模式：必须循环读直到 EAGAIN，否则可能丢失事件
     while (true) {
         char buf[4096];
         int byte_read = recv(m_sockfd, buf, sizeof(buf) - 1, 0);
@@ -383,7 +386,7 @@ void HttpConn::serve_static_file() {
     m_bytes_have_send = 0;
 }
 
-// send_error()：不同连接可能产生不同错误，提供统一接口封装响应逻辑，将所有的发送准备做好
+//send_error()：不同连接可能产生不同错误，提供统一接口封装响应逻辑，将所有的发送准备做好
 void HttpConn::send_error(int code, const char* msg) {
     std::string body = "<html><body><h1>" + std::to_string(code) +
                        " " + msg + "</h1></body></html>";
