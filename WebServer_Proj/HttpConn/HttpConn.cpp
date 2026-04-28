@@ -146,8 +146,11 @@ bool HttpConn::write() {
             //头发完了体没发完
             while (m_iv_count > 0 && static_cast<size_t>(bytes_written) >= m_iv[0].iov_len) {
                 bytes_written -= m_iv[0].iov_len;
-                m_iv[0] = m_iv[1];  //前移
                 m_iv_count--;
+                //修复：考虑只有一个响应头的情况
+                if (m_iv_count > 0) {
+                    m_iv[0] = m_iv[1];  //修复bug:当聚合写的内存段只有一段的时候原代码会越界读（不存在m_iv[1]，里面全是脏数据）
+                }
             }
             //最后一个 iov 部分发送
             if (m_iv_count > 0 && bytes_written > 0) {
