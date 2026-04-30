@@ -1487,7 +1487,7 @@ int main() {
 }
 '''
 
-## 2026.4.29 Timer初探
+## 2026.4.29-30 Timer初探
 一个服务器能够接纳的TCP连接是有限的，服务器本身的资源也是有限的，在实际运行中，无法避免地存在问题连接，它们可能出现了临时断网或各种各样的设备问题，或者干脆就是恶意连接，只建立连接而不发送数据，大量此类连接堆积的结果是：消耗有限的文件描述符和内存资源，占用Epoll红黑树节点，影响其他连接的处理效率。我们引入计时器类，来定时针对这些占用资源但是不传数据的连接进行清理。
 我们可以想象出Timer类的功能：对每一个连接进行计时，一旦其超过一个特定时间仍然不发送数据，就发送超时信号，并将fd保存在某个数据结构中，引导服务器对其进行清理。
 我们想到的方式是将所有连接的fd存放在链表中，用过期的绝对时间戳决定先后，这种数据结构的好处是：先后非常明显，只要查询到某一个节点没有过期，那它之后的节点一定也仍未过期，只需将它前面节点中的fd发送出去即可。
@@ -1503,8 +1503,7 @@ sig_handler()只需完成一个绝对信号安全的操作，对管道写端pipe
 
 ### Timer程序测试
 先手写一个最简单的Timer，并进行测试。
-#### 成员变量设置
-信号处理函数sig_handler()
+
 #### 链表节点构造
 所有连接的fd和它们的过时时间是用链表存储的，我们首先需要定义链表节点。
 '''
@@ -1514,5 +1513,75 @@ struct TimerNode{
     TimerNode(int f,time_t ex) : fd(f),expire(ex) {}
 };
 '''
-TimerTest类的私有部分里包含异常处理函数sig_handler()，两个pipefd_数组表示管道读写端，其中一个是静态的，专供信号处理函数访问
+#### public部分：Timer的初始化和链表操作
+一个Timer实例通过init()方法进行构造：传入epoll_fd预备监听管道读端，调用socketpair创建一个socket对（相当于pipe），将写端设置为非阻塞，注册读端到epoll监听事件，注册信号并启动定时。其中注册信号和启动定时有特殊的方法。
+'''
+//关键：注册信号
+        struct sigaction sa; //定义sigaction结构体变量
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sig_handler; //设定：信号来了调用sig_handler
+        sigfillset(&sa.sa_mask); //sa_mask表示处理信号期间屏蔽哪些信号，调用sigfillset表示屏蔽全部
+        sigaction(SIGALRM, &sa, nullptr);//sigaction方法：关注闹钟信号SIGALRM，执行处理方案sa(让sig_handler处理)，nullptr表示不关心旧的处理方式
+        sigaction(SIGTERM, &sa, nullptr);//SIGTERM为终止信号(kill发送的信号)，执行处理方案sa，nullptr
+        //启动定时 alarm
+        alarm(TIMESLOT);
+        std::cout << "[TimerTest] Init OK, TIMESLOT=" << TIMESLOT << "s" << std::endl;
+        return true;
+'''
+sigaction结构体专门用于描述信号的处理方案，监听什么信号？信号来了用什么函数处理？这些问题都由sigaction解决。初始化一个sigaction变量后设置处理函数为sig_handler()，
+调用sigfillset(&sa.sa_mask)表示处理信号期间屏蔽其他所有信号防止打断处理过程。
+**sigaction()方法用于设置关注的信号和信号来临时调用的信号处理方案，这里设置闹钟信号SIGALRM和终止信号SIGTERM，当接收到这两个信号时，跳转到处理函数sig_handler()。**
+alarm方法：设置内核闹钟，TIMESLOT时间后给我发SIGALRM，只响一次，需要重新设置！
+
+'''
+//tick：返回超时fd列表
+    std::vector<int> tick() {
+        std::vector<int> expired;
+        time_t now = time(nullptr);
+        auto it = list_.begin();
+        //遍历链表，判断时间戳是否小于现在时间（小于则代表超时）
+        while (it != list_.end()) {
+            if (it->expire <= now) {
+                std::cout << "  [Timer] fd=" << it->fd << " TIMEOUT!" << std::endl;
+                expired.push_back(it->fd);//加入超时数组
+                it = list_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        alarm(TIMESLOT);  //重新设置alarm
+        return expired;
+    }
+'''
+tick方法：遍历链表找出超时fd并返回超时fd数组，传到管道进行清理
+**注意：alarm响完一次之后需要重新设置**
+
+#### private部分
+TimerTest类的私有部分里包含异常处理函数sig_handler()，pipefd_数组表示管道读写端，其中一个是静态的，专供信号处理函数访问
 ，以及用于调用epoll_ctl注册读端到epoll的epoll_fd。
+'''
+private:
+    //TimerTest的静态指针，通过桥接法操作真正的处理函数
+    static TimerTest* s_instance;
+    static void sig_handler(int sig){
+        if(s_instance){
+            s_instance -> handle_signal(sig);
+        }
+    }
+    void handle_signal(int sig) {
+        int save_errno = errno;
+        char msg = (char)sig;
+        send(pipefd_[1], &msg, 1, 0);  //发送信号内容
+        errno = save_errno;
+    }
+    int pipefd_[2];
+    int epoll_fd_;
+    std::list<TimerNode> list_;
+'''
+**静态桥接法的原理**
+这里出现了一个特殊的构造：私有部分里出现了一个指向TimerTest*的静态指针s_instance，并且信号处理不是一个简单的函数sig_handler()，而是在handler里通过s_instance指向真正的处理函handle_signal。
+这样的处理称为“静态桥接法”。本质是用于解决以下的两个矛盾：
+1：操作系统的sigaction是C语言的API，sigaction()要求传入一个纯粹的函数指针，形如void (*handler)(int); 只有一个参数。但是，如果用一个普通的c++类中成员函数void handle_signal(int sig)作为处理函数，由于其成员函数的属性，函数签名里必然隐含了一个this指针，用来指向一个确切的Timer成员，这就使得函数签名出现了不同，根本传不进去。
+解决这个问题的方法是：使用类的静态方法，由于静态函数属于一整个类，不属于某个具体的对象，它的函数签名中不需要一个this指针，可以解决函数签名对不上的问题。但是这样就出现了新的矛盾：
+2：静态函数属于整个类，它没有权限访问成员变量！
+解决方法：在类中引入一个静态指针s_instance，在初始化中将其指向this。当信号到来时，操作系统调用一个静态函数sig_handler()，在其内部，通过s_instance指针找到对象并执行它的成员函数，即真正的处理函数handle_signal()。从而可以用这个处理函数来操作实例pipefd_。
