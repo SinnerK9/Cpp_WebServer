@@ -12,6 +12,7 @@
 #include "../Thread_Pool/Thread_Pool.h"
 #include "../Epoller/Epoller.h"
 #include "../HttpConn/HttpConn.h"
+#include "../Timer/Timer.h"
 
 class WebServer {
 public:
@@ -37,19 +38,21 @@ private:
     void handle_read_(int fd);     //处理读事件
     void handle_write_(int fd);    //处理写事件
     void handle_close_(int fd);    //处理关闭/错误
+    void handle_timer_(); //处理计时器事件
 
     //连接管理
     void add_client_(int fd, const sockaddr_in& addr);
     void close_client_(int fd);
 
     //成员变量
-    int  port_;
-    int  listen_fd_;
+    int port_;
+    int listen_fd_;
     std::atomic<bool> is_running_; //atomic，防止竞争乱改
 
     //核心组件，生命周期由WebServer管理
     Epoller    epoller_;
     ThreadPool thread_pool_;
+    Timer timer_;
 
     //堆分配连接数组，防止栈溢出
     static const int MAX_FD = 65536;

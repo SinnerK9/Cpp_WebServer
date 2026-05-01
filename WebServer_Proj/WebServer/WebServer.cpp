@@ -69,6 +69,7 @@ bool WebServer::init_socket_() {
     
     //注册到 Epoller:注意要反复用，不能EPOLLONESHOT
     epoller_.add_fd(listen_fd_, EPOLLIN | EPOLLET | EPOLLRDHUP);
+    timer_.init(epoller_.epoll_fd());
     std::cout << "[WebServer] Listening on port " << port_
               << " (Reactor Mode, " << "ET + ThreadPool)" << std::endl;
     return true;
@@ -106,7 +107,11 @@ void WebServer::start() {
                 handle_listen_();
                 continue;
             }
-
+            //有fd过期了，跳转到过期fd处理逻辑
+            if (fd == timer_.get_pipe_read_fd() && (events & EPOLLIN)) {
+                handle_timer_();
+                continue;
+            }
             //连接异常（对端关闭/RST/错误）
             if (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
                 handle_close_(fd);
@@ -166,7 +171,7 @@ void WebServer::add_client_(int fd, const sockaddr_in& addr) {
     }
 
     users_[fd].init(fd, addr);
-
+    timer_.add_timer(fd, addr);//新连接加入定时
     std::cout << "[WebServer] New connection: fd=" << fd
               << " IP=" << users_[fd].get_ip()
               << " Port=" << users_[fd].get_port()
@@ -183,7 +188,7 @@ void WebServer::handle_read_(int fd) {
         handle_close_(fd);
         return;
     }
-
+    timer_.adjust_timer(fd);//fd活动了，刷新定时
     //读到数据了，把CPU密集的解析+响应生成提交到线程池
     thread_pool_.submit([this, fd]() {
         users_[fd].process();
@@ -195,6 +200,7 @@ void WebServer::handle_write_(int fd) {
     //特殊性：write由主线程完成，目前的文件大小不足以阻塞
     if (conn.write()) {
         //发送完成
+        timer_.adjust_timer(fd);//刷新定时
         if (conn.is_keep_alive()) {
             //是长连接！重置状态，继续监听下一个请求
             conn.reset();
@@ -209,8 +215,28 @@ void WebServer::handle_write_(int fd) {
     }
 }
 
+//add:handle_timer():读出信号，进行超时fd处理
+void WebServer::handle_timer_() {
+    //消费管道数据
+    char buf[64];
+    int ret;
+    while ((ret = recv(timer_.get_pipe_read_fd(), buf, sizeof(buf), 0)) > 0) {
+        for (ssize_t j = 0; j < ret && j < 64; j++) {
+            if (buf[j] == SIGALRM) continue;//定时触发
+            if (buf[j] == SIGTERM) stop(); //终止信号
+        }
+    }
+
+    //处理超时连接
+    std::vector<int> expired = timer_.tick();
+    for (int fd : expired) {
+        handle_close_(fd);
+    }
+}
+
 //handle_close_()关闭连接
 void WebServer::handle_close_(int fd) {
+    timer_.del_timer(fd);//关闭时：移除计时器！
     std::cout << "[WebServer] Closing fd: " << fd << std::endl;
     users_[fd].close_conn(true);
 }
