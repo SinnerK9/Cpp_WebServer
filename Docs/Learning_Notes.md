@@ -1587,3 +1587,146 @@ private:
 解决方法：在类中引入一个静态指针s_instance，在初始化中将其指向this。当信号到来时，操作系统调用一个静态函数sig_handler()，在其内部，通过s_instance指针找到对象并执行它的成员函数，即真正的处理函数handle_signal()。从而可以用这个处理函数来操作实例pipefd_。
 
 fix a bug:在实际测试中发现只能得到一个SIGALRM，设置在第五秒和第八秒过期的fd都没有收到过期标志。经过详细检查后发现，我忘记了将管道的读端设置为非阻塞，导致第一次recv得到通知发送响应之后，再读管道发现没有数据，陷入沉睡，不会再执行tick执行alarm重新设置闹钟，等不到下一个读事件，主线程会直接睡死在recv里！设置非阻塞后，主线程recv发现没有数据，会返回EAGAIN并接着去执行下一个tick进行闹钟的设置。
+
+## 2026.5.1 Timer模块化
+定时器检测的是"连接是否在指定时间内有活动"，这要求两样东西：
+一个持续运行的执行体——有人得定期醒来，遍历链表，比较时间
+考虑统一的时机——不能和I/O事件打架，不能阻塞
+
+WebServer拥有事件循环，是唯一持续运行的实体。所以Timer只能放在 WebServer里。
+
+struct TimerNode 没有塞进 HttpConn，HttpConn完全不知道自己在被计时。这也是我们先前刻意设计的结果，加定时器功能，无需对HttpConn进行任意改动。
+
+### TimerNode结构体
+TimerNode机构体定义在Timer/TimerNode.h，独立于Timer类本身。
+'''
+struct TimerNode {
+    int          fd;        // 被计时的 socket
+    time_t       expire;    // 绝对过期时刻，不是"已空闲时长"
+    sockaddr_in  addr;      // 客户端地址（日志用）
+};
+'''
+expire存储的是绝对时间戳。不存"空闲了几秒"，tick时只需比较time(nullptr) >= expire，无需计算差值。升序链表按expire排列。tick时从头遍历，遇第一个未过期的就停止，其余不用检查，这是升序链表带来的价值。
+
+### Timer类方法
+
+#### 构造函数与析构函数
+Timer::Timer() : pipefd_{-1, -1}, epoll_fd_(-1) {
+    list_.clear();
+}
+Timer::~Timer() {
+    if (pipefd_[0] >= 0) close(pipefd_[0]);
+    if (pipefd_[1] >= 0) close(pipefd_[1]);
+    list_.clear();
+}
+
+#### init(int epoll_fd)：初始化函数
+构造函数只分配成员，不依赖外部资源。管道创建、信号注册、alarm启动依赖 epoll_fd，而epoll_fd在WebServer::init_socket_() 之后才确定。所以拆成两步：构造 → init()。
+'''
+bool Timer::init(int epoll_fd) {
+    epoll_fd_ = epoll_fd;
+    s_instance_ = this;  // 桥接：让信号处理函数能找到这个实例
+    // 1. 创建 socketpair 管道
+    socketpair(PF_UNIX, SOCK_STREAM, 0, pipefd_);
+    // 2. 写端非阻塞：信号处理函数中 send 不能阻塞
+    //    读端非阻塞：主循环 while(recv) 依赖非阻塞退出
+    fcntl(pipefd_[1], F_SETFL, O_NONBLOCK);
+    fcntl(pipefd_[0], F_SETFL, O_NONBLOCK);
+    // 3. 管道读端注册到 epoll（LT 模式，内存通信不丢数据）
+    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, pipefd_[0], EPOLLIN);
+    // 4. 注册信号（SA_RESTART：epoll_wait 被信号中断后自动重启）
+    add_sig_(SIGALRM, sig_handler_, true);
+    add_sig_(SIGTERM, sig_handler_, true);
+    // 5. 启动首次 alarm
+    set_alarm_();
+}
+'''
+关键点：**管道两端都必须非阻塞!**
+写端非阻塞是因为信号处理函数不能阻塞（会延长信号屏蔽时间）；读端非阻塞是因为第一次recv得到通知发送响应之后，再读管道发现没有数据，陷入沉睡，不会再执行tick执行alarm重新设置闹钟，等不到下一个读事件，主线程会直接睡死在recv里！设置非阻塞后，主线程recv发现没有数据，会返回EAGAIN并接着去执行下一个tick进行闹钟的设置。
+
+SA_RESTART 的作用：默认情况下SIGALRM会打断epoll_wait使其返回 -1 + EINTR。SA_RESTART让被打断的系统调用自动重新发起，避免EINTR分支的胶水代码，也避免管道事件在中断窗口丢失。
+
+#### add_sig_()：封装信号注册
+'''
+void Timer::add_sig_(int sig, void (*handler)(int), bool restart) {
+    struct sigaction sa;
+    memset(&sa, '\0', sizeof(sa));
+    sa.sa_handler = handler;
+    if (restart) sa.sa_flags |= SA_RESTART;
+    sigfillset(&sa.sa_mask);  // 处理信号期间屏蔽所有其他信号
+    sigaction(sig, &sa, nullptr);
+}
+'''
+
+#### add_timer(int fd, const sockaddr_in& addr)：升序插入
+'''
+void Timer::add_timer(int fd, const sockaddr_in& addr) {
+    time_t expire = time(nullptr) + 3 * TIMESLOT;
+    TimerNode node(fd, expire, addr);
+    // 遍历链表，找到第一个 expire 比新节点大的位置，插在前面
+    for (auto it = list_.begin(); it != list_.end(); ++it) {
+        if (node.expire < it->expire) {
+            list_.insert(it, node);
+            return;
+        }
+    }
+    list_.push_back(node);  //比所有节点都晚，放末尾
+}
+'''
+新连接在3个监测周期内至少要有一次活动，否则超时！
+和先前的TimerTest实现相比，Timer模块内部自己算expire，无需lifetime_sec
+
+#### adjust_timer(int fd)：刷新过期时间
+'''
+void Timer::adjust_timer(int fd) {
+    for (auto it = list_.begin(); it != list_.end(); ++it) {
+        if (it->fd == fd) {
+            sockaddr_in addr = it->addr;
+            list_.erase(it);
+            add_timer(fd, addr);  // 删除 + 重新升序插入
+            return;
+        }
+    }
+}
+'''
+有数据交互时调用，重新计算过期时间为 当前 + 3 × TIMESLOT。
+真实服务器中，每次read()和发送完成的write()都属于活动，需要调用这个函数进行刷新时间
+
+#### del_timer(int fd)：移除定时器
+'''
+void Timer::del_timer(int fd) {
+    for (auto it = list_.begin(); it != list_.end(); ++it) {
+        if (it->fd == fd) { list_.erase(it); return; }
+    }
+}
+'''
+
+**tick()：心跳，返回超时fd列表**
+'''
+std::vector<int> Timer::tick() {
+    std::vector<int> expired;
+    time_t now = time(nullptr);
+    auto it = list_.begin();
+    while (it != list_.end()) {
+        if (it->expire <= now) {
+            expired.push_back(it->fd);
+            it = list_.erase(it);
+        } else {
+            break;  // 升序链表核心价值：后面全部未过期
+        }
+    }
+    set_alarm_();  // 重置 alarm，开始下一轮
+    return expired;
+}
+'''
+对比我们前面完成的TimerTest：TimerTest的tick()遍历全部节点（没有 break提前终止），加上set_alarm_()。Timer模块增加了升序链表的提前终止优化。
+
+### 与WebServer的集成
+前面我们提到：Timer只能由掌管事件循环的WebServer进行管理，Timer的方法需要集成到WebServer中来发挥作用。
+
+WebServer事件与Timer行为的对应：
+add_client_() → 新连接 -> timer_.add_timer(fd, addr)
+handle_read_() → 有数据 -> timer_.adjust_timer(fd)
+handle_write_() → 发送完成 -> timer_.adjust_timer(fd)
+handle_close_() → 关闭连接 -> timer_.del_timer(fd)
+每个连接从创建到关闭，定时器全程追踪其活跃状态。
