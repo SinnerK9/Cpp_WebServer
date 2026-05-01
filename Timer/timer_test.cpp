@@ -22,19 +22,21 @@ public:
     TimerTest() : pipefd_{-1,-1} {}
     bool init(int epoll_fd){
         epoll_fd_ = epoll_fd;
-        s_instance = this;
+        s_instance = this; //初始化：将静态指针指向这个Timer实例
         //创建管道
         if (socketpair(PF_UNIX, SOCK_STREAM, 0, pipefd_) < 0) {
             perror("socketpair");
             return false;
         }
-        //写端设为非阻塞
-        int flags = fcntl(pipefd_[1],F_GETFL,0);
-        fcntl(pipefd_[1], F_SETFL, flags | O_NONBLOCK);
+        //更正：读端和写端都要设为非阻塞
+        int flags0 = fcntl(pipefd_[1],F_GETFL,0);
+        fcntl(pipefd_[1], F_SETFL, flags0 | O_NONBLOCK);
+        int flags1 = fcntl(pipefd_[0],F_GETFL,0);
+        fcntl(pipefd_[0],F_SETFL,flags1 | O_NONBLOCK);
         //读端注册到epoll监听读事件
         struct epoll_event ev;
         ev.data.fd = pipefd_[0];
-        ev.events = EPOLLIN | EPOLLET;
+        ev.events = EPOLLIN;
         epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, pipefd_[0], &ev);
         //关键：注册信号
         struct sigaction sa; //定义sigaction结构体变量，用于描述信号来了该怎么处理
@@ -75,6 +77,7 @@ public:
         return expired;
     }
 private:
+    //TimerTest的静态指针，通过桥接法操作真正的处理函数
     static TimerTest* s_instance;
     static void sig_handler(int sig){
         if(s_instance){
@@ -90,7 +93,6 @@ private:
     int pipefd_[2];
     int epoll_fd_;
     std::list<TimerNode> list_;
-    static int pipefd_[2]; //静态，信号处理函数访问
 };
 TimerTest* TimerTest::s_instance  = nullptr;
 
@@ -126,8 +128,9 @@ int main(){
                           << time(nullptr) << std::endl;
                 //读管道中数据
                 char buf[64];
-                while (recv(fd, buf, sizeof(buf), 0) > 0) {
-                    for (int j = 0; j < (int)sizeof(buf); j++) {
+                ssize_t ret;
+                while ((ret = recv(fd, buf, sizeof(buf), 0)) > 0) {
+                    for (int j = 0; j < ret; j++) {
                         //是闹钟信号
                         if (buf[j] == SIGALRM) {
                             std::cout << "  → SIGALRM received" << std::endl;
@@ -137,6 +140,9 @@ int main(){
                             running = false;
                         }
                     }
+                }
+                if (ret == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    perror("recv");
                 }
                 //执行tick
                 std::vector<int> expired = timer.tick();
@@ -155,4 +161,4 @@ int main(){
     std::cout << "Test done." << std::endl;
     return 0;
 
-}
+} 
