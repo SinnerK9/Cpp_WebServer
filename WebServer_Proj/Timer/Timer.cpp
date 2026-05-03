@@ -1,4 +1,5 @@
 #include "Timer.h"
+#include "../Logger/Logger.h"
 
 Timer* Timer::s_instance_ = nullptr;
 
@@ -23,7 +24,7 @@ bool Timer::init(int epoll_fd) {
 
     //创建管道
     if (socketpair(PF_UNIX, SOCK_STREAM, 0, pipefd_) < 0) {
-        perror("[Timer] socketpair failed");
+        LOG_ERROR("[Timer] socketpair failed");
         return false;
     }
 
@@ -47,9 +48,7 @@ bool Timer::init(int epoll_fd) {
     //首次alarm
     set_alarm_();
 
-    std::cout << "[Timer] Initialized. TIMESLOT=" << TIMESLOT << "s"
-              << ", pipefd=[" << pipefd_[0] << "," << pipefd_[1] << "]"
-              << std::endl;
+    LOG_INFO("[Timer] Initialized. TIMESLOT=%ds, pipefd=[%d,%d]",TIMESLOT,pipefd_[0],pipefd_[1]);
     return true;
 }
 
@@ -135,11 +134,11 @@ std::vector<int> Timer::tick() {
     auto it = list_.begin();
     while (it != list_.end()) {
         if (it->expire <= now) {
-            std::cout << "  [Timer] fd=" << it->fd << " timeout" << std::endl;
+            LOG_INFO("  [Timer] fd = %d timeout",it->fd);
             expired.push_back(it->fd);
             it = list_.erase(it);
         } else {
-            break;  // 升序：后面的expire都更大
+            break;  //升序：后面的expire都更大
         }
     }
 
