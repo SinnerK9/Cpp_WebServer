@@ -1730,3 +1730,93 @@ handle_read_() → 有数据 -> timer_.adjust_timer(fd)
 handle_write_() → 发送完成 -> timer_.adjust_timer(fd)
 handle_close_() → 关闭连接 -> timer_.del_timer(fd)
 每个连接从创建到关闭，定时器全程追踪其活跃状态。
+
+## 模块化Logger类：日志系统
+Logger类是整个高并发服务器的“黑匣子”与“时间切片机”。在每秒几千次并发请求的复杂环境中，如果没有任何记录，一旦出现Bug，排查将如同大海捞针。Logger 负责将各个线程、各个模块产生的信息，打上精确到微秒的时间戳，安全、有序地刻录到磁盘上。
+关键设计：极简的Header-only架构与同步解耦。摒弃了早期繁琐的异步外壳，直接利用现代C++特性（std::ofstream, std::mutex, Magic Static）直击日志记录的本质,把外部无数个线程的并发输出，收束成一条整齐单向的字符流。
+
+### 单例模式与生命周期管理 (Magic Static)
+这部分取代了传统的双重检查锁（DCL）单例模式，极大地简化了代码，同时负责文件流对象的生命周期。
+关键设计：Meyers Singleton（局部静态变量单例）。C++11后局部静态变量的初始化是绝对线程安全的。无需手动加锁，编译器在底层保证了instance只会被实例化一次。配合RAII机制，析构时自动释放文件句柄。
+'''
+class Logger {
+public:
+    static Logger& get() {
+        // C++11 保证此处的初始化绝对线程安全
+        static Logger instance;  
+        return instance;
+    }
+
+    bool init(const char* filepath) {
+        // std::ios::app 追加模式，防止覆盖历史日志
+        file_.open(filepath, std::ios::app);
+        return file_.is_open();
+    }
+private:
+    Logger() = default;
+    ~Logger() { if (file_.is_open()) file_.close(); }
+    // 禁用拷贝与赋值
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
+    
+    std::ofstream file_;
+    std::mutex mtx_;
+};
+'''
+
+### write()：核心流水线与时间戳
+write() 方法是整个日志系统的总控车间。它负责时间获取、等级判定、字符串组装和最终落盘。
+关键设计1：微秒级精度（gettimeofday）。摒弃普通的 time()，因为高并发服务器一秒内可能发生上万次事件，只精确到秒会导致成百上千行日志时间完全相同，失去时序追踪的意义。
+关键设计2：互斥锁保护。多线程环境下，必须在流水线入口加 std::lock_guard。如果不加锁，线程A刚写了半句，线程B就插进来写了一句，日志文件会变成无法阅读的乱码。
+'''
+void write(int level, const char* format, ...) {
+    std::lock_guard<std::mutex> lock(mtx_); //抢占单例，独占流水线
+
+    // 1. 获取微秒级时间戳
+    struct timeval now;
+    gettimeofday(&now, nullptr);
+    struct tm* local = localtime(&now.tv_sec);
+
+    char time_buf[64];
+    snprintf(time_buf, sizeof(time_buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
+             local->tm_year + 1900, local->tm_mon + 1, local->tm_mday,
+             local->tm_hour, local->tm_min, local->tm_sec, now.tv_usec);
+
+    // 2. 匹配日志等级标签
+    const char* level_str = (level == LOG_INFO) ? "[INFO] " : ... ;
+
+    // ... (接后续组装逻辑)
+'''
+
+### 可变参数处理与强制刷盘
+关键设计1：C风格的格式化组装。采用了 va_list + vsnprintf。这允许我们像写printf一样（例如 LOG_INFO("fd=%d", fd)）传递任意数量的参数，并在底层直接操作内存块，速度极快。
+关键设计2：强制刷盘（flush）。这是服务器查Bug的救命稻草。写完内存缓冲区后立刻调用 flush()，拿枪指着操作系统把数据刻到物理硬盘上，防止服务器崩溃时丢失死机前最后一瞬间的致命报错日志。
+'''
+// 3. 组装用户传来的可变参数 (va_list 机制)
+    char content_buf[4096];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(content_buf, sizeof(content_buf), format, args);
+    va_end(args);
+
+    // 4. 终极缝合
+    std::string final_line = std::string(time_buf) + " " + level_str + " " + content_buf + "\n";
+    
+    // 5. 落盘并强制刷出操作系统缓存！
+    if (file_.is_open()) {
+        file_ << final_line;
+        file_.flush();  
+    }
+}
+'''
+直接调用 Logger::get().write(...) 太过繁琐。系统在头文件最下方定义了一组宏，作为供外部模块调用的便捷接口。
+关键设计：预处理 ##__VA_ARGS__。 __VA_ARGS__ 用于接收 ... 带来的所有剩余参数。对于前面的##，当使用者只传了一个纯字符串（没有后续参数）时，## 会让编译器自动删掉前面多余的逗号，避开了宏展开编译错误。
+'''
+// ============================================================
+// 给外界使用的简易宏接口 (可放在任何 .cpp 中直接调用)
+// ============================================================
+#define LOG_DEBUG(format, ...) Logger::get().write(LOG_DEBUG, format, ##__VA_ARGS__)
+#define LOG_INFO(format, ...)  Logger::get().write(LOG_INFO,  format, ##__VA_ARGS__)
+#define LOG_WARN(format, ...)  Logger::get().write(LOG_WARN,  format, ##__VA_ARGS__)
+#define LOG_ERROR(format, ...) Logger::get().write(LOG_ERROR, format, ##__VA_ARGS__)
+'''
