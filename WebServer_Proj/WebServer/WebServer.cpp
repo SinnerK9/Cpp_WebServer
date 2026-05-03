@@ -1,4 +1,5 @@
 #include "WebServer.h"
+#include "../Logger/Logger.h"
 #include <cstring>
 #include <iostream>
 #include <cassert>
@@ -37,7 +38,7 @@ bool WebServer::init_socket_() {
     // ---- 1. socket ----
     listen_fd_ = socket(PF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
-        perror("WebServer: socket() failed");
+        LOG_ERROR("WebServer: socket() failed: %s", strerror(errno));
         return false;
     }
 
@@ -55,14 +56,14 @@ bool WebServer::init_socket_() {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port        = htons(port_);
     if (bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("WebServer: bind() failed");
+        LOG_ERROR("WebServer: bind() failed: %s", strerror(errno));
         close(listen_fd_);
         return false;
     }
 
     //listen
     if (listen(listen_fd_, 5) < 0) {
-        perror("WebServer: listen() failed");
+        LOG_ERROR("WebServer: listen() failed: %s", strerror(errno));
         close(listen_fd_);
         return false;
     }
@@ -70,8 +71,7 @@ bool WebServer::init_socket_() {
     //注册到 Epoller:注意要反复用，不能EPOLLONESHOT
     epoller_.add_fd(listen_fd_, EPOLLIN | EPOLLET | EPOLLRDHUP);
     timer_.init(epoller_.epoll_fd());
-    std::cout << "[WebServer] Listening on port " << port_
-              << " (Reactor Mode, " << "ET + ThreadPool)" << std::endl;
+    LOG_INFO("[WebServer] Listening on port %d (Reactor Mode ET + ThreadPool)" , port_);
     return true;
 }
 
@@ -80,12 +80,12 @@ bool WebServer::init_socket_() {
 //对应原代码的while(true)
 void WebServer::start() {
     if (!init_socket_()) {
-        std::cerr << "[WebServer] Socket initialization failed!" << std::endl;
+        LOG_ERROR("[WebServer] Socket initialization failed!");
         return;
     }
 
     is_running_ = true;
-    std::cout << "[WebServer] Reactor event loop started." << std::endl;
+    LOG_INFO("[WebServer] Reactor event loop started.");
 
     //REACTOR主循环
     while (is_running_) {
@@ -93,7 +93,7 @@ void WebServer::start() {
 
         if (n < 0) {
             if (errno == EINTR) continue;  //被信号中断，重试
-            perror("WebServer: epoll_wait error");
+            LOG_ERROR("WebServer: epoll_wait error: %s", strerror(errno));
             break;
         }
 
@@ -131,7 +131,7 @@ void WebServer::start() {
         }
     }
 
-    std::cout << "[WebServer] Reactor event loop stopped." << std::endl;
+    LOG_INFO("[WebServer] Reactor event loop stopped.");
 }
 
 
@@ -154,7 +154,7 @@ void WebServer::handle_listen_() {
                 //没有更多连接了，退出循环
                 break;
             }
-            perror("WebServer: accept() error");
+            LOG_ERROR("WebServer: accept() error: %s", strerror(errno));
             break;
         }
         //交给HttpConn初始化
@@ -165,17 +165,15 @@ void WebServer::handle_listen_() {
 //交给HttpConn初始化
 void WebServer::add_client_(int fd, const sockaddr_in& addr) {
     if (fd >= MAX_FD) {
-        std::cerr << "[WebServer] Too many connections, close fd: " << fd << std::endl;
+        LOG_ERROR("[WebServer] Too many connections, close fd: %d" ,fd);
         close(fd);
         return;
     }
 
     users_[fd].init(fd, addr);
     timer_.add_timer(fd, addr);//新连接加入定时
-    std::cout << "[WebServer] New connection: fd=" << fd
-              << " IP=" << users_[fd].get_ip()
-              << " Port=" << users_[fd].get_port()
-              << " Total=" << HttpConn::m_user_count << std::endl;
+    LOG_INFO("[WebServer] New connection: fd=%d IP=%s Port=%d Total=%d",
+         fd, users_[fd].get_ip(), users_[fd].get_port(), (int)HttpConn::m_user_count);
 }
 
 
@@ -219,7 +217,7 @@ void WebServer::handle_write_(int fd) {
 void WebServer::handle_timer_() {
     //消费管道数据
     char buf[64];
-    int ret;
+    ssize_t ret;
     while ((ret = recv(timer_.get_pipe_read_fd(), buf, sizeof(buf), 0)) > 0) {
         for (ssize_t j = 0; j < ret && j < 64; j++) {
             if (buf[j] == SIGALRM) continue;//定时触发
@@ -237,6 +235,6 @@ void WebServer::handle_timer_() {
 //handle_close_()关闭连接
 void WebServer::handle_close_(int fd) {
     timer_.del_timer(fd);//关闭时：移除计时器！
-    std::cout << "[WebServer] Closing fd: " << fd << std::endl;
+    LOG_INFO("[WebServer] Closing fd: %d",fd);
     users_[fd].close_conn(true);
 }
