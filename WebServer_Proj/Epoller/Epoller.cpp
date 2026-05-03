@@ -1,6 +1,8 @@
 #include "Epoller.h"
+#include "../Logger/Logger.h"
 #include <unistd.h>
 #include <iostream>
+#include <cstring>
 
 // 构造函数
 Epoller::Epoller(int max_events)
@@ -8,7 +10,7 @@ Epoller::Epoller(int max_events)
     , events_(max_events)
 {
     if (epoll_fd_ < 0) {
-        perror("Epoller: epoll_create1 failed");
+        LOG_ERROR("Epoller: epoll_create1 failed: %s", strerror(errno)); //输出日志
         throw std::runtime_error("Epoller initialization failed");
     }
 }
@@ -52,7 +54,7 @@ int Epoller::wait(int timeout_ms) {
                        static_cast<int>(events_.size()),
                        timeout_ms);
     if (n < 0 && errno != EINTR) {
-        perror("Epoller: epoll_wait failed");
+        LOG_ERROR("Epoller: epoll_create1 failed: %s",strerror(errno)); //输出日志
     }
     return n;
 }
