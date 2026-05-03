@@ -1,5 +1,5 @@
 #include "MySQL_Pool/MySQL_Pool.h"
-#include <iostream>
+#include "../Logger/Logger.h"
 #include <cstring>
 
 //配置常量定义
@@ -49,15 +49,14 @@ void MySQLPool::init_pool_() {
             current_size_++;
         }
     }
-    std::cout << "[MySQLPool] Initialized with " << current_size_
-              << " connections." << std::endl;
+    LOG_INFO("[MySQLPool] Initialized with %zu connections", current_size_); //输出日志，注意：size_t类型是%zu
 }
 
 //创建单条连接
 MYSQL* MySQLPool::create_conn_() {
     MYSQL* conn = mysql_init(nullptr);
     if (conn == nullptr) {
-        std::cerr << "[MySQLPool] mysql_init() failed!" << std::endl;
+        LOG_ERROR("[MySQLPool] mysql_init() failed!");
         return nullptr;
     }
 
@@ -69,8 +68,7 @@ MYSQL* MySQLPool::create_conn_() {
     //mysql_real_connect判断是否连接成功
     if (!mysql_real_connect(conn, HOST, USER, PASSWORD,
                             DB_NAME, PORT, nullptr, 0)) {
-        std::cerr << "[MySQLPool] mysql_real_connect() failed: "
-                  << mysql_error(conn) << std::endl;
+        LOG_ERROR( "[MySQLPool] mysql_real_connect() failed: %s",mysql_error(conn));
         mysql_close(conn);
         return nullptr;
     }
@@ -97,7 +95,7 @@ MYSQL* MySQLPool::get_conn() {
 
     if (conn_queue_.empty()) {
         //超时！实在没有返回来的空闲连接，返回个NULL
-        std::cerr << "[MySQLPool] No idle connection available!" << std::endl;
+        LOG_ERROR("[MySQLPool] No idle connection available!");
         return nullptr;
     }
 
